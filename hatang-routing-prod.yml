@@ -1,0 +1,36 @@
+version: '3.8'
+
+services:
+  # FastAPI Application
+  hatang.routingapi:
+    image: 192.168.100.43:5000/hatang.routing.api:0.0.1
+    container_name: routing_api
+    environment:
+      MONGODB_URI: ${MONGODB_URI:-mongodb://localhost:27017}
+      DATABASE_NAME: ${DATABASE_NAME:-routing_db}
+    ports:
+      - "${API_PORT:-8000}:8000"
+    volumes:
+      # Optional: mount logs directory
+      - ./logs:/app/logs
+    networks:
+      - routing_network
+    healthcheck:
+      test: curl -f http://localhost:8000/health || exit 1
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+    restart: unless-stopped
+
+networks:
+  routing_network:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: "173.24.0.0/16"
+
+extra_hosts:
+      - "mongo-node1:192.168.100.103"
+      - "mongo-node2:192.168.100.104"
+      - "mongo-node3:192.168.100.105"
