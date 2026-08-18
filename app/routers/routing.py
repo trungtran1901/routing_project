@@ -3,8 +3,10 @@ from typing import Optional
 from motor.motor_asyncio import AsyncIOMotorDatabase
 
 from app.core.database import get_database
+from app.core.postgis import get_pg_pool
 from app.models.point import PointCreateRequest, PointDeleteRequest
 from app.services.routing_service import process_add_point, handle_delete_point, get_diagram_data, get_fiber_diagram_data, get_sid_diagram_data
+from app.services.gis_incremental_sync import sync_route_scope
 from app.models.cable import CableSyncRequest
 from app.services.cable_detail_service import sync_cable_detail
 router = APIRouter(prefix="/routing", tags=["Routing"])
@@ -12,6 +14,27 @@ router = APIRouter(prefix="/routing", tags=["Routing"])
 
 def get_db() -> AsyncIOMotorDatabase:
     return get_database()
+
+
+async def _trigger_gis_incremental_sync(db: AsyncIOMotorDatabase, parent_id: str) -> None:
+    """
+    Đồng bộ GIS (PostGIS) ngay sau khi routing thay đổi topology của 1 tuyến,
+    giới hạn phạm vi 1 tuyến (nhanh) thay vì quét toàn bộ DB.
+
+    Cố ý "best-effort": nếu PostGIS chưa kết nối được hoặc lỗi bất kỳ, KHÔNG
+    được làm hỏng response của API routing (vốn đã ghi MongoDB thành công) -
+    chỉ log cảnh báo. Map sẽ tự bắt kịp ở lần /map/sync định kỳ kế tiếp nếu
+    incremental sync lần này thất bại.
+    """
+    try:
+        pool = get_pg_pool()
+    except RuntimeError as e:
+        print(f"[WARN] Bỏ qua GIS incremental sync (PostGIS chưa sẵn sàng): {e}")
+        return
+    try:
+        await sync_route_scope(db, pool, parent_id)
+    except Exception as e:
+        print(f"[WARN] GIS incremental sync thất bại cho tuyến '{parent_id}' (không ảnh hưởng routing): {e}")
 
 
 @router.post("/points", summary="Thêm mới điểm vào tuyến (cuối hoặc chèn giữa)")
@@ -27,9 +50,14 @@ async def add_point(
 
     - **start_point có giá trị** (ma_diem của điểm trước): **Chèn vào giữa**.
       Vô hiệu hóa đoạn cũ, tạo 2 đoạn mới.
+
+    Sau khi ghi MongoDB thành công, hệ thống tự động đồng bộ (gần như ngay
+    lập tức) điểm/đoạn cáp liên quan sang GIS layer (PostGIS) trong phạm vi
+    tuyến này, để điểm mới xuất hiện trên map mà không cần đợi /map/sync.
     """
     try:
         result = await process_add_point(db, payload)
+        await _trigger_gis_incremental_sync(db, payload.parent_id)
         return {"success": True, "data": result}
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
@@ -48,9 +76,15 @@ async def delete_point(
 
     - Điểm ở **cuối tuyến**: vô hiệu hóa 1 đoạn, không tạo thêm.
     - Điểm ở **giữa tuyến**: vô hiệu hóa 2 đoạn, tạo 1 đoạn nối mới A→C.
+
+    Sau khi ghi MongoDB thành công, hệ thống tự động đồng bộ GIS layer:
+    điểm bị xóa và các đoạn cáp không còn active sẽ được soft-delete khỏi
+    PostGIS (không còn hiển thị trên map), đoạn nối mới (nếu có) sẽ xuất
+    hiện ngay.
     """
     try:
         result = await handle_delete_point(db, payload)
+        await _trigger_gis_incremental_sync(db, payload.parent_id)
         return {"success": True, "data": result}
     except ValueError as e:
         raise HTTPException(status_code=404, detail=str(e))
