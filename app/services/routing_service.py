@@ -1,14 +1,3 @@
-"""
-Service xử lý bài toán routing cho tuyến cáp.
-Việc tạo/xóa điểm do cơ chế riêng bên ngoài xử lý.
-API này chỉ quản lý đoạn cáp (cable) giữa các điểm.
-
-Ba trường hợp chính:
-1. Điểm mới thêm vào CUỐI tuyến   → tạo 1 đoạn cáp (điểm cuối cũ → điểm mới)
-2. Điểm mới CHÈN vào GIỮA 2 điểm → vô hiệu hóa đoạn cũ, tạo 2 đoạn mới
-3. Điểm bị XÓA                    → vô hiệu hóa đoạn + detail + sid, nối lại A→C
-"""
-
 import uuid
 from datetime import datetime, timezone
 from typing import Optional, Dict, Any, List
@@ -23,13 +12,10 @@ from app.core.database import (
 )
 from app.models.point import PointCreateRequest, PointDeleteRequest
 
-# Collection tuyến chính
 COLLECTION_TUYEN = "instance_data_hatang_quanlytuyen_newversion"
 
+POINT_TYPES_SKIP_CABLE = {"Hạ ngầm"}
 
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
 
 def _new_id() -> str:
     return uuid.uuid4().hex
@@ -66,7 +52,6 @@ def _build_cable_doc(
     total_cable: Optional[float] = None,
     cable_type: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
-    """Tạo document đoạn cáp mới."""
     code = f"{start_ma}-{end_ma}"
     now = _now()
     return {
@@ -91,15 +76,10 @@ def _build_cable_doc(
     }
 
 
-# ---------------------------------------------------------------------------
-# Truy vấn helpers
-# ---------------------------------------------------------------------------
-
 async def _get_tuyen_info(
     db: AsyncIOMotorDatabase,
     parent_id: str,
 ) -> Optional[Dict[str, Any]]:
-    """Lấy thông tin tuyến từ collection tuyến chính theo _id = parent_id của điểm."""
     return await db[COLLECTION_TUYEN].find_one(
         {"_id": parent_id, "is_deleted": False},
         {"total_cable": 1, "loai_cable_f0": 1},
@@ -118,7 +98,6 @@ async def _update_so_luong_mx(
     parent_id: str,
     now: datetime,
 ) -> int:
-    """Đếm điểm active thuộc tuyến rồi cập nhật so_luong_mx trên collection tuyến."""
     count = await db[COLLECTION_POINTS].count_documents(
         {"parent_id": parent_id, "is_deleted": False}
     )
@@ -134,11 +113,6 @@ async def _soft_delete_cables_by_point(
     ma_diem: str,
     now: datetime,
 ) -> List[str]:
-    """
-    Vô hiệu hóa tất cả đoạn cáp có start_point HOẶC end_point = ma_diem.
-    Trả về danh sách _id các đoạn bị xóa để cascade xuống detail và sid.
-    """
-    # Lấy _id các đoạn trước khi xóa
     cursor = db[COLLECTION_CABLES].find(
         {
             "$or": [{"start_point": ma_diem}, {"end_point": ma_diem}],
@@ -154,7 +128,6 @@ async def _soft_delete_cables_by_point(
             {"_id": {"$in": cable_ids}},
             {"$set": {"is_deleted": True, "modified_by_date": now}},
         )
-        # Cascade → cable_detail
         detail_cursor = db[COLLECTION_CABLE_DETAIL].find(
             {"parent_id": {"$in": cable_ids}, "is_deleted": False},
             {"_id": 1},
@@ -167,7 +140,6 @@ async def _soft_delete_cables_by_point(
                 {"_id": {"$in": detail_ids}},
                 {"$set": {"is_deleted": True, "modified_by_date": now}},
             )
-            # Cascade → sid_cable
             await db[COLLECTION_SID_CABLE].update_many(
                 {"parent_id": {"$in": detail_ids}, "is_deleted": False},
                 {"$set": {"is_deleted": True, "modified_by_date": now}},
@@ -182,7 +154,6 @@ async def _soft_delete_cable_between(
     end_ma: str,
     now: datetime,
 ) -> int:
-    """Vô hiệu hóa đoạn cáp nối đúng start_ma → end_ma (không cascade, dùng khi tạo lại)."""
     result = await db[COLLECTION_CABLES].update_many(
         {"start_point": start_ma, "end_point": end_ma, "is_deleted": False},
         {"$set": {"is_deleted": True, "modified_by_date": now}},
@@ -190,23 +161,14 @@ async def _soft_delete_cable_between(
     return result.modified_count
 
 
-# ---------------------------------------------------------------------------
-# Use-case 1: Điểm thêm vào CUỐI tuyến
-# ---------------------------------------------------------------------------
-
 async def handle_add_point_to_end(
     db: AsyncIOMotorDatabase,
     new_point: Dict[str, Any],
 ) -> Dict[str, Any]:
-    """
-    Điểm mới thêm vào cuối tuyến (start_point = None).
-    Lấy total_cable và loai_cable_f0 từ collection tuyến chính để gắn vào đoạn cáp tạo mới.
-    """
     ma_tuyen = new_point["ma_tuyen"]
     parent_id = new_point["parent_id"]
     ma_diem_moi = new_point["ma_diem"]
 
-    # Tìm điểm cuối hiện tại, loại trừ chính điểm mới
     cursor = (
         db[COLLECTION_POINTS]
         .find({
@@ -230,7 +192,6 @@ async def handle_add_point_to_end(
             "so_luong_mx": so_luong_mx,
         }
 
-    # Lấy thông tin tuyến để gắn total_cable và cable_type
     tuyen_info = await _get_tuyen_info(db, parent_id)
     total_cable = tuyen_info.get("total_cable") if tuyen_info else None
     cable_type = tuyen_info.get("loai_cable_f0") if tuyen_info else None
@@ -249,7 +210,6 @@ async def handle_add_point_to_end(
     )
     await db[COLLECTION_CABLES].insert_one(cable)
 
-    # Cập nhật so_luong_mx trên tuyến
     so_luong_mx = await _update_so_luong_mx(db, parent_id, _now())
 
     return {
@@ -260,19 +220,11 @@ async def handle_add_point_to_end(
     }
 
 
-# ---------------------------------------------------------------------------
-# Use-case 2: Điểm CHÈN vào GIỮA 2 điểm
-# ---------------------------------------------------------------------------
-
 async def handle_insert_point_between(
     db: AsyncIOMotorDatabase,
     new_point: Dict[str, Any],
     start_point_ma: str,
 ) -> Dict[str, Any]:
-    """
-    Điểm mới chèn vào giữa. Lấy total_cable và loai_cable_f0 từ tuyến chính
-    để gắn vào các đoạn cáp tạo mới.
-    """
     parent_id = new_point["parent_id"]
     ma_tuyen = new_point.get("ma_tuyen")
 
@@ -280,7 +232,6 @@ async def handle_insert_point_between(
     if start_point_doc is None:
         raise ValueError(f"Không tìm thấy điểm bắt đầu '{start_point_ma}'")
 
-    # Lấy thông tin tuyến
     tuyen_info = await _get_tuyen_info(db, parent_id)
     total_cable = tuyen_info.get("total_cable") if tuyen_info else None
     cable_type = tuyen_info.get("loai_cable_f0") if tuyen_info else None
@@ -299,11 +250,9 @@ async def handle_insert_point_between(
         old_end_doc = await _get_point_by_ma(db, old_end_ma)
         old_end_ten = old_end_doc["ten_diem"] if old_end_doc else old_end_ma
 
-        # Vô hiệu hóa đoạn cũ (không cascade vì đoạn đang bị thay thế, không bị xóa vĩnh viễn)
         await _soft_delete_cable_between(db, start_point_ma, old_end_ma, now)
         disabled_cables.append(existing_cable.get("code", f"{start_point_ma}-{old_end_ma}"))
 
-        # Tạo đoạn 1: start → điểm mới
         cable1 = _build_cable_doc(
             parent_id=parent_id,
             start_ma=start_point_ma,
@@ -318,7 +267,6 @@ async def handle_insert_point_between(
         await db[COLLECTION_CABLES].insert_one(cable1)
         created_cables.append(cable1["code"])
 
-        # Tạo đoạn 2: điểm mới → end_cũ
         cable2 = _build_cable_doc(
             parent_id=parent_id,
             start_ma=new_point["ma_diem"],
@@ -372,24 +320,37 @@ async def handle_insert_point_between(
         }
 
 
-# ---------------------------------------------------------------------------
-# Use-case 3: Xóa điểm → vô hiệu hóa đoạn + cascade detail + sid, nối lại A→C
-# ---------------------------------------------------------------------------
+async def handle_add_point_no_cable(
+    db: AsyncIOMotorDatabase,
+    new_point: Dict[str, Any],
+) -> Dict[str, Any]:
+    parent_id = new_point["parent_id"]
+    point_type_label = None
+    pt = new_point.get("point_type")
+    if isinstance(pt, dict):
+        point_type_label = pt.get("value")
+
+    so_luong_mx = await _update_so_luong_mx(db, parent_id, _now())
+
+    return {
+        "action": "add_no_cable",
+        "message": (
+            f"Điểm loại '{point_type_label}' không làm thay đổi topology đoạn cáp - "
+            f"giữ nguyên đoạn cáp hiện có, không tạo/xoá đoạn nào."
+        ),
+        "created_cables": [],
+        "disabled_cables": [],
+        "so_luong_mx": so_luong_mx,
+    }
+
 
 async def handle_delete_point(
     db: AsyncIOMotorDatabase,
     request: PointDeleteRequest,
 ) -> Dict[str, Any]:
-    """
-    Khi điểm B bị xóa:
-    1. Tìm đoạn A→B và B→C trước khi xóa.
-    2. Soft-delete đoạn liên quan + cascade xuống cable_detail + sid_cable.
-    3. Nếu B nằm giữa → tạo đoạn A→C (lấy total_cable, cable_type từ tuyến).
-    """
     now = _now()
     ma_diem = request.ma_diem
 
-    # Lấy đoạn vào và ra trước khi xóa
     cable_in = await db[COLLECTION_CABLES].find_one(
         {"end_point": ma_diem, "is_deleted": False}
     )
@@ -397,18 +358,15 @@ async def handle_delete_point(
         {"start_point": ma_diem, "is_deleted": False}
     )
 
-    # Soft-delete tất cả đoạn liên quan + cascade detail + sid
     deleted_cable_ids = await _soft_delete_cables_by_point(db, ma_diem, now)
 
     created_cable: Optional[str] = None
 
-    # Nếu B nằm giữa A và C → nối lại A→C
     if cable_in and cable_out:
         point_a = await _get_point_by_ma(db, cable_in["start_point"])
         point_c = await _get_point_by_ma(db, cable_out["end_point"])
 
         if point_a and point_c:
-            # Lấy thông tin tuyến để gắn total_cable và cable_type
             tuyen_info = await _get_tuyen_info(db, request.parent_id)
             total_cable = tuyen_info.get("total_cable") if tuyen_info else None
             cable_type = tuyen_info.get("loai_cable_f0") if tuyen_info else None
@@ -444,7 +402,6 @@ async def handle_delete_point(
             await db[COLLECTION_CABLES].insert_one(new_cable)
             created_cable = new_cable["code"]
 
-    # Cập nhật so_luong_mx trên tuyến
     so_luong_mx = await _update_so_luong_mx(db, request.parent_id, now)
 
     return {
@@ -461,21 +418,15 @@ async def handle_delete_point(
     }
 
 
-# ---------------------------------------------------------------------------
-# Entry point tổng hợp
-# ---------------------------------------------------------------------------
-
 async def process_add_point(
     db: AsyncIOMotorDatabase,
     payload: PointCreateRequest,
 ) -> Dict[str, Any]:
-    """
-    Điểm đã được tạo sẵn trong DB bởi cơ chế ngoài.
-    Phân nhánh dựa vào payload.start_point:
-      - None        → điểm thêm vào cuối tuyến
-      - có giá trị  → điểm chèn vào giữa
-    """
     new_point = payload.model_dump(exclude_none=False)
+
+    point_type_val = payload.point_type.value if payload.point_type is not None else None
+    if point_type_val in POINT_TYPES_SKIP_CABLE:
+        return await handle_add_point_no_cable(db, new_point)
 
     start_ma = payload.start_point.value if payload.start_point is not None else None
 
@@ -484,14 +435,6 @@ async def process_add_point(
     else:
         return await handle_add_point_to_end(db, new_point)
 
-
-# ---------------------------------------------------------------------------
-# Use-case 4: Lấy dữ liệu sơ đồ tuyến (nodes + edges)
-# ---------------------------------------------------------------------------
-
-# ---------------------------------------------------------------------------
-# Helper: làm sạch doc trước khi đưa vào customData
-# ---------------------------------------------------------------------------
 
 _AUDIT_FIELDS = {
     "created_by_id", "created_by_name", "created_by_fullname",
@@ -503,7 +446,6 @@ _AUDIT_FIELDS = {
 
 
 def _clean_doc(doc: Dict[str, Any], exclude_keys: set = None) -> Dict[str, Any]:
-    """Loại bỏ _id, audit fields và chuyển ObjectId thành string."""
     skip = {"_id"} | _AUDIT_FIELDS | (exclude_keys or set())
     return {
         k: (str(v) if v.__class__.__name__ == "ObjectId" else v)
@@ -517,7 +459,6 @@ async def _resolve_parent_id(
     tuyen_id: Optional[str],
     ma_tuyen: Optional[str],
 ) -> str:
-    """Trả về parent_id từ tuyen_id hoặc ma_tuyen."""
     if tuyen_id:
         return tuyen_id
     sample = await db[COLLECTION_POINTS].find_one(
@@ -534,7 +475,6 @@ async def get_diagram_data(
     tuyen_id: Optional[str] = None,
     ma_tuyen: Optional[str] = None,
 ) -> Dict[str, Any]:
-    """Sơ đồ tuyến: nodes là điểm, edges là đoạn cáp."""
     if not tuyen_id and not ma_tuyen:
         raise ValueError("Cần truyền tuyen_id hoặc ma_tuyen.")
 
@@ -568,44 +508,34 @@ async def get_diagram_data(
     edges = []
     for c in cables:
         start_text = c.get("start_point_text") or ""
-        end_text   = c.get("end_point_text") or ""
+        end_text = c.get("end_point_text") or ""
         label = f"{start_text} - {end_text}" if start_text and end_text else (start_text or end_text)
         edges.append({
-            "id":         c.get("code", ""),
-            "from":       c.get("start_point", ""),
-            "to":         c.get("end_point", ""),
-            "label":      label,
+            "id": c.get("code", ""),
+            "from": c.get("start_point", ""),
+            "to": c.get("end_point", ""),
+            "label": label,
             "customData": _clean_doc(c),
         })
 
     return {"nodes": nodes, "edges": edges}
 
 
-# ---------------------------------------------------------------------------
-# Use-case 5: Sơ đồ tuyến theo SỢI (cable_detail là edge, có list_sid)
-# ---------------------------------------------------------------------------
-
 async def get_fiber_diagram_data(
     db: AsyncIOMotorDatabase,
     tuyen_id: Optional[str] = None,
     ma_tuyen: Optional[str] = None,
 ) -> Dict[str, Any]:
-    """
-    Sơ đồ tuyến: nodes là điểm, edges là SỢI (cable_detail).
-    from/to kế thừa từ đoạn cha. Mỗi sợi có thêm list_sid (array SID active).
-    """
     if not tuyen_id and not ma_tuyen:
         raise ValueError("Cần truyền tuyen_id hoặc ma_tuyen.")
 
     parent_id = await _resolve_parent_id(db, tuyen_id, ma_tuyen)
 
-    # Điểm → nodes
     points_cursor = db[COLLECTION_POINTS].find(
         {"parent_id": parent_id, "is_deleted": False},
     )
     points = await points_cursor.to_list(length=None)
 
-    # Đoạn cáp → chỉ cần routing info + _id để map
     cable_query = (
         {"ma_tuyen": ma_tuyen, "is_deleted": False}
         if ma_tuyen
@@ -620,16 +550,15 @@ async def get_fiber_diagram_data(
 
     cable_map: Dict[str, Dict[str, Any]] = {
         c["_id"]: {
-            "start_point":      c.get("start_point", ""),
-            "end_point":        c.get("end_point", ""),
+            "start_point": c.get("start_point", ""),
+            "end_point": c.get("end_point", ""),
             "start_point_text": c.get("start_point_text", ""),
-            "end_point_text":   c.get("end_point_text", ""),
+            "end_point_text": c.get("end_point_text", ""),
         }
         for c in cables
     }
     cable_ids = list(cable_map.keys())
 
-    # Sợi (cable_detail)
     fibers: List[Dict[str, Any]] = []
     if cable_ids:
         fibers_cursor = db[COLLECTION_CABLE_DETAIL].find(
@@ -637,7 +566,6 @@ async def get_fiber_diagram_data(
         )
         fibers = await fibers_cursor.to_list(length=None)
 
-    # SID: lấy toàn bộ SID active theo fiber_ids, group theo parent_id
     fiber_ids = [f["_id"] for f in fibers]
     sid_map: Dict[str, List[Dict[str, Any]]] = {}
     if fiber_ids:
@@ -649,7 +577,6 @@ async def get_fiber_diagram_data(
             pid = s.get("parent_id", "")
             sid_map.setdefault(pid, []).append(_clean_doc(s))
 
-    # Build nodes
     nodes = []
     for p in points:
         pt = p.get("point_type")
@@ -657,19 +584,18 @@ async def get_fiber_diagram_data(
         custom = _clean_doc(p)
         custom["type"] = point_type_val or ""
         nodes.append({
-            "id":    p["ma_diem"],
+            "id": p["ma_diem"],
             "label": p.get("ten_diem", ""),
             "customData": custom,
         })
 
-    # Build edges từ sợi
     edges = []
     for f in fibers:
         cable_parent = cable_map.get(f.get("parent_id"), {})
         from_point = cable_parent.get("start_point", "")
-        to_point   = cable_parent.get("end_point", "")
-        from_text  = cable_parent.get("start_point_text", "")
-        to_text    = cable_parent.get("end_point_text", "")
+        to_point = cable_parent.get("end_point", "")
+        from_text = cable_parent.get("start_point_text", "")
+        to_text = cable_parent.get("end_point_text", "")
 
         cable_number = f.get("cable_number", "")
         label = (
@@ -679,28 +605,22 @@ async def get_fiber_diagram_data(
         )
 
         custom_edge = _clean_doc(f)
-        # Thông tin routing từ đoạn cha
-        custom_edge["_cable_start_point"]      = from_point
-        custom_edge["_cable_end_point"]        = to_point
+        custom_edge["_cable_start_point"] = from_point
+        custom_edge["_cable_end_point"] = to_point
         custom_edge["_cable_start_point_text"] = from_text
-        custom_edge["_cable_end_point_text"]   = to_text
-        # Danh sách SID active thuộc sợi này
+        custom_edge["_cable_end_point_text"] = to_text
         custom_edge["list_sid"] = sid_map.get(str(f["_id"]), [])
 
         edges.append({
-            "id":         str(f["_id"]),
-            "from":       from_point,
-            "to":         to_point,
-            "label":      label,
+            "id": str(f["_id"]),
+            "from": from_point,
+            "to": to_point,
+            "label": label,
             "customData": custom_edge,
         })
 
     return {"nodes": nodes, "edges": edges}
 
-
-# ---------------------------------------------------------------------------
-# Use-case 6: Sơ đồ dịch vụ theo SID
-# ---------------------------------------------------------------------------
 
 COLLECTION_TUYEN_READ = "instance_data_hatang_quanlytuyen_newversion"
 
@@ -709,27 +629,6 @@ async def get_sid_diagram_data(
     db: AsyncIOMotorDatabase,
     sid_value: str,
 ) -> Dict[str, Any]:
-    """
-    Sơ đồ dịch vụ cho một SID cụ thể.
-    Một SID có thể đi qua nhiều tuyến, nhiều sợi, nhiều đoạn.
-
-    Luồng truy vết:
-      SID.value
-        → sid_cable (SID.value match, is_deleted=false)
-        → cable_detail (_id = sid_cable.parent_id, is_deleted=false)
-        → cable (_id = cable_detail.parent_id, is_deleted=false)
-        → tuyen (_id = cable.parent_id)
-        → điểm (parent_id = tuyen._id, is_deleted=false)
-
-    Trả về:
-      nodes: các điểm thuộc các tuyến mà SID đi qua
-             customData gồm đầy đủ thông tin điểm + ten_tuyen, ma_tuyen của tuyến
-      edges: các đoạn cáp mà SID đi qua
-             customData gồm đầy đủ thông tin đoạn + fiber (sợi) + sid info
-    """
-    # ------------------------------------------------------------------
-    # Bước 1: Tìm tất cả sid_cable có SID.value = sid_value
-    # ------------------------------------------------------------------
     sid_docs_cursor = db[COLLECTION_SID_CABLE].find(
         {"SID.value": sid_value, "is_deleted": False},
         {"_id": 1, "parent_id": 1, "SID": 1, "ten_khach_hang": 1, "ma_tuyen": 1},
@@ -741,9 +640,6 @@ async def get_sid_diagram_data(
 
     fiber_ids = list({s["parent_id"] for s in sid_docs})
 
-    # ------------------------------------------------------------------
-    # Bước 2: Lấy cable_detail (sợi) từ fiber_ids
-    # ------------------------------------------------------------------
     fibers_cursor = db[COLLECTION_CABLE_DETAIL].find(
         {"_id": {"$in": fiber_ids}, "is_deleted": False},
         {"_id": 1, "parent_id": 1, "cable_number": 1, "status": 1, "ma_tuyen": 1},
@@ -751,24 +647,16 @@ async def get_sid_diagram_data(
     fibers = await fibers_cursor.to_list(length=None)
 
     cable_ids = list({f["parent_id"] for f in fibers})
-    # map fiber_id → fiber doc
     fiber_map: Dict[str, Dict[str, Any]] = {f["_id"]: f for f in fibers}
 
-    # ------------------------------------------------------------------
-    # Bước 3: Lấy cable (đoạn) từ cable_ids
-    # ------------------------------------------------------------------
     cables_cursor = db[COLLECTION_CABLES].find(
         {"_id": {"$in": cable_ids}, "is_deleted": False},
     )
     cables = await cables_cursor.to_list(length=None)
 
     tuyen_ids = list({c["parent_id"] for c in cables})
-    # map cable_id → cable doc
     cable_map_full: Dict[str, Dict[str, Any]] = {c["_id"]: c for c in cables}
 
-    # ------------------------------------------------------------------
-    # Bước 4: Lấy thông tin tuyến
-    # ------------------------------------------------------------------
     tuyen_cursor = db[COLLECTION_TUYEN_READ].find(
         {"_id": {"$in": tuyen_ids}},
         {"_id": 1, "ma_tuyen": 1, "ten_tuyen": 1},
@@ -776,18 +664,11 @@ async def get_sid_diagram_data(
     tuyen_docs = await tuyen_cursor.to_list(length=None)
     tuyen_map: Dict[str, Dict[str, Any]] = {t["_id"]: t for t in tuyen_docs}
 
-    # ------------------------------------------------------------------
-    # Bước 5: Lấy tất cả điểm thuộc các tuyến đó
-    # ------------------------------------------------------------------
     points_cursor = db[COLLECTION_POINTS].find(
         {"parent_id": {"$in": tuyen_ids}, "is_deleted": False},
     )
     all_points = await points_cursor.to_list(length=None)
 
-    # ------------------------------------------------------------------
-    # Bước 6: Build nodes - chỉ lấy điểm liên quan đến các đoạn SID đi qua
-    # ------------------------------------------------------------------
-    # Tập hợp ma_diem xuất hiện trong start_point/end_point của đoạn SID
     relevant_ma_diem: set = set()
     for c in cables:
         if c.get("start_point"):
@@ -809,21 +690,16 @@ async def get_sid_diagram_data(
         tuyen_info = tuyen_map.get(p.get("parent_id"), {})
 
         custom = _clean_doc(p)
-        custom["type"]      = point_type_val or ""
-        custom["ma_tuyen"]  = tuyen_info.get("ma_tuyen", "")
+        custom["type"] = point_type_val or ""
+        custom["ma_tuyen"] = tuyen_info.get("ma_tuyen", "")
         custom["ten_tuyen"] = tuyen_info.get("ten_tuyen", "")
 
         nodes.append({
-            "id":    p["ma_diem"],
+            "id": p["ma_diem"],
             "label": p.get("ten_diem", ""),
             "customData": custom,
         })
 
-    # ------------------------------------------------------------------
-    # Bước 7: Build edges - mỗi đoạn cáp SID đi qua
-    #         Gắn thêm fiber và sid info vào customData
-    # ------------------------------------------------------------------
-    # Build map sid_cable theo fiber_id để tra nhanh
     sid_by_fiber: Dict[str, List[Dict]] = {}
     for s in sid_docs:
         sid_by_fiber.setdefault(s["parent_id"], []).append(_clean_doc(s))
@@ -833,51 +709,50 @@ async def get_sid_diagram_data(
 
     for sid_doc in sid_docs:
         fiber_id = sid_doc["parent_id"]
-        fiber    = fiber_map.get(fiber_id)
+        fiber = fiber_map.get(fiber_id)
         if not fiber:
             continue
 
         cable_id = fiber["parent_id"]
-        cable    = cable_map_full.get(cable_id)
+        cable = cable_map_full.get(cable_id)
         if not cable:
             continue
 
         edge_id = cable.get("code") or cable_id
-        # Có thể nhiều sợi/SID cùng đoạn → tạo edge riêng mỗi sợi
         edge_key = f"{edge_id}__fiber__{fiber_id}"
         if edge_key in seen_edge_ids:
             continue
         seen_edge_ids.add(edge_key)
 
-        tuyen_info  = tuyen_map.get(cable.get("parent_id"), {})
-        start_text  = cable.get("start_point_text") or ""
-        end_text    = cable.get("end_point_text") or ""
-        cable_num   = fiber.get("cable_number", "")
+        tuyen_info = tuyen_map.get(cable.get("parent_id"), {})
+        start_text = cable.get("start_point_text") or ""
+        end_text = cable.get("end_point_text") or ""
+        cable_num = fiber.get("cable_number", "")
         label = (
             f"[{tuyen_info.get('ma_tuyen', '')}] "
             f"{start_text} - {end_text} (sợi {cable_num})"
         )
 
         custom_edge = _clean_doc(cable)
-        custom_edge["ma_tuyen"]  = tuyen_info.get("ma_tuyen", "")
+        custom_edge["ma_tuyen"] = tuyen_info.get("ma_tuyen", "")
         custom_edge["ten_tuyen"] = tuyen_info.get("ten_tuyen", "")
         custom_edge["fiber"] = {
             "cable_number": fiber.get("cable_number"),
-            "status":       fiber.get("status"),
-            "ma_tuyen":     fiber.get("ma_tuyen"),
+            "status": fiber.get("status"),
+            "ma_tuyen": fiber.get("ma_tuyen"),
         }
         custom_edge["list_sid"] = sid_by_fiber.get(fiber_id, [])
 
         edges.append({
-            "id":    edge_key,
-            "from":  cable.get("start_point", ""),
-            "to":    cable.get("end_point", ""),
+            "id": edge_key,
+            "from": cable.get("start_point", ""),
+            "to": cable.get("end_point", ""),
             "label": label,
             "customData": custom_edge,
         })
 
     return {
-        "sid":   sid_value,
+        "sid": sid_value,
         "nodes": nodes,
         "edges": edges,
     }

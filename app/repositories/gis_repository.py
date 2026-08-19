@@ -1,33 +1,10 @@
-"""
-Data-access layer cho PostGIS (geo_points / geo_segments).
-
-Convention: giống app/services/*.py hiện tại - dùng raw query (ở đây là SQL
-qua asyncpg thay vì Mongo filter), trả về dict/list dict, không lộ driver-
-specific object ra ngoài router.
-
-Kể từ migration 002, mọi query ĐỌC đều lọc `is_deleted = false` (điểm/đoạn
-đã bị soft-delete sẽ không xuất hiện trên map nữa, dù vẫn còn bản ghi trong
-bảng để giữ lịch sử / tránh phải xoá cứng).
-"""
-
 import json
 from typing import Any, Dict, List, Optional
 
 import asyncpg
 
 
-# ---------------------------------------------------------------------------
-# Points
-# ---------------------------------------------------------------------------
-
 async def upsert_points_batch(pool: asyncpg.pool.Pool, points: List[Dict[str, Any]]) -> int:
-    """
-    Upsert hàng loạt điểm vào geo_points.
-    Mỗi phần tử: {source_id, parent_id, ma_tuyen, ten_diem, point_type, lng, lat}
-    Idempotent: dùng ON CONFLICT (source_id) DO UPDATE.
-    Luôn set is_deleted = false (kể cả khi trước đó điểm này đã bị soft-delete
-    và nay xuất hiện lại active trong MongoDB).
-    """
     if not points:
         return 0
     async with pool.acquire() as conn:
@@ -59,7 +36,6 @@ async def upsert_points_batch(pool: asyncpg.pool.Pool, points: List[Dict[str, An
 
 
 async def soft_delete_points(pool: asyncpg.pool.Pool, source_ids: List[str]) -> int:
-    """Đánh dấu is_deleted=true cho các điểm không còn active ở MongoDB."""
     if not source_ids:
         return 0
     result = await pool.execute(
@@ -125,24 +101,6 @@ async def get_points_bbox_clustered(
     grid_cols: int, grid_rows: int,
     limit: int,
 ) -> List[Dict[str, Any]]:
-    """
-    Gom cụm điểm trong viewport theo lưới NxN chia đều trên chính viewport đó
-    (giống cơ chế marker clustering của Google Maps) — dùng `width_bucket()`
-    có sẵn của PostgreSQL để bỏ vào 1 trong grid_cols*grid_rows ô lưới.
-
-    Vì lưới chia theo VIEWPORT (không phải toạ độ tuyệt đối/geohash cố định),
-    số ô luôn <= grid_cols*grid_rows bất kể viewport rộng hay hẹp, hay có bao
-    nhiêu điểm bên trong — response luôn bị chặn kích thước, giải quyết đúng
-    vấn đề "zoom nhỏ tải toàn bộ điểm". Khi zoom lớn (viewport hẹp), số điểm
-    thực tế trong khung thường đã nhỏ hơn số ô lưới -> tự nhiên mỗi ô có
-    đúng 1 điểm -> trả về điểm thật (không bị gom), giống Google Maps.
-
-    Mỗi ô lưới trả về:
-    - cnt = 1  -> trả điểm thật (source_id, ten_diem... như bbox thường)
-    - cnt > 1  -> trả 1 pseudo-node "cluster": tâm (trung bình toạ độ), count,
-                  và bbox bao các điểm trong cụm (để frontend fitBounds khi
-                  người dùng click vào cụm để "zoom vào xem chi tiết").
-    """
     rows = await pool.fetch(
         """
         WITH pts AS (
@@ -182,7 +140,6 @@ async def get_points_bbox_clustered(
 
 
 async def get_points_by_parent(pool: asyncpg.pool.Pool, parent_id: str) -> List[Dict[str, Any]]:
-    """Toàn bộ điểm active thuộc 1 tuyến (parent_id = tuyến._id), dùng cho GET /map/routes."""
     rows = await pool.fetch(
         """
         SELECT source_id, parent_id, ma_tuyen, ten_diem, point_type,
@@ -196,11 +153,6 @@ async def get_points_by_parent(pool: asyncpg.pool.Pool, parent_id: str) -> List[
 
 
 async def get_point_ids_by_parent_all(pool: asyncpg.pool.Pool, parent_id: str) -> List[Dict[str, Any]]:
-    """
-    Toàn bộ điểm thuộc 1 tuyến trong PostGIS (KHÔNG lọc is_deleted) - dùng để
-    incremental sync so sánh với danh sách active hiện tại ở MongoDB, từ đó
-    biết điểm nào cần soft-delete.
-    """
     rows = await pool.fetch(
         "SELECT source_id, is_deleted FROM geo_points WHERE parent_id = $1",
         parent_id,
@@ -234,7 +186,6 @@ async def nearby_points(
 async def update_point_geometry(
     pool: asyncpg.pool.Pool, source_id: str, lng: float, lat: float,
 ) -> Optional[Dict[str, Any]]:
-    """Cập nhật geometry (vị trí) của 1 điểm đã tồn tại trong geo_points."""
     row = await pool.fetchrow(
         """
         UPDATE geo_points
@@ -249,27 +200,6 @@ async def update_point_geometry(
 
 
 async def sync_connected_segments_endpoint(pool: asyncpg.pool.Pool, point_id: str) -> List[Dict[str, Any]]:
-    """
-    Sau khi 1 điểm bị dời vị trí, MỌI đoạn cáp nối tới điểm này (bất kể
-    geometry_source là AUTO hay USER) cần dịch chuyển theo, nếu không map sẽ
-    hiển thị sai lệch (đoạn "đứt" khỏi điểm mà nó vốn phải nối tới).
-
-    Cách làm: chỉ thay đúng 1 ĐỈNH (vertex) đầu hoặc cuối của LineString -
-    đúng vertex trùng với điểm vừa di chuyển - bằng ST_SetPoint(), thay vì vẽ
-    lại toàn bộ đường bằng ST_MakeLine(). Nhờ vậy:
-    - Đoạn AUTO (chỉ 2 điểm, đường thẳng) → kết quả giống hệt cách cũ (vẽ
-      lại đường thẳng nối 2 điểm).
-    - Đoạn USER (nhiều điểm, do người dùng tự vẽ tay trên map) → CHỈ đầu mút
-      trùng với điểm bị di chuyển được cập nhật, các điểm uốn ở giữa (hình
-      dạng người dùng đã tự vẽ) được GIỮ NGUYÊN — trước đây các đoạn USER bị
-      bỏ qua hoàn toàn (đóng băng vĩnh viễn, không bao giờ di chuyển theo
-      điểm), đây chính là lỗi đã báo cáo và được sửa ở đây.
-
-    KHÔNG tăng geometry_version (đây là hệ thống tự khớp lại theo điểm, khác
-    với việc người dùng chủ động sửa geometry qua PUT /map/segments/{id}/geometry).
-
-    Trả về danh sách {source_id, geometry_source} các đoạn đã được cập nhật.
-    """
     rows = await pool.fetch(
         """
         UPDATE geo_segments s
@@ -289,20 +219,7 @@ async def sync_connected_segments_endpoint(pool: asyncpg.pool.Pool, point_id: st
     return [{"source_id": r["source_id"], "geometry_source": r["geometry_source"]} for r in rows]
 
 
-# ---------------------------------------------------------------------------
-# Segments
-# ---------------------------------------------------------------------------
-
 async def upsert_segments_batch(pool: asyncpg.pool.Pool, segments: List[Dict[str, Any]]) -> int:
-    """
-    Upsert hàng loạt đoạn cáp vào geo_segments.
-    Mỗi phần tử: {source_id, parent_id, ma_tuyen, start_point_id, end_point_id,
-                  start_lng, start_lat, end_lng, end_lat}
-    Sync luôn set geometry_source = AUTO và geometry_version = 1 CHỈ KHI segment
-    chưa tồn tại. Nếu đã tồn tại và geometry_source = USER (người dùng đã tự
-    vẽ), KHÔNG được ghi đè geometry — chỉ cập nhật các field routing.
-    Luôn set is_deleted = false.
-    """
     if not segments:
         return 0
     async with pool.acquire() as conn:
@@ -322,8 +239,6 @@ async def upsert_segments_batch(pool: asyncpg.pool.Pool, segments: List[Dict[str
                     start_point_id = EXCLUDED.start_point_id,
                     end_point_id   = EXCLUDED.end_point_id,
                     is_deleted     = false,
-                    -- Chỉ tự cập nhật lại geometry AUTO nếu segment hiện tại
-                    -- cũng đang là AUTO (chưa từng bị người dùng chỉnh trên map).
                     geometry = CASE
                         WHEN geo_segments.geometry_source = 'AUTO'
                         THEN EXCLUDED.geometry
@@ -342,8 +257,72 @@ async def upsert_segments_batch(pool: asyncpg.pool.Pool, segments: List[Dict[str
     return len(segments)
 
 
+async def recompute_virtual_segments_for_cable(
+    pool: asyncpg.pool.Pool,
+    cable_id: str,
+    parent_id: Optional[str],
+    ma_tuyen: Optional[str],
+    chain_points: List[Dict[str, Any]],
+) -> List[str]:
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            if len(chain_points) <= 2:
+                await conn.execute(
+                    "DELETE FROM geo_segments WHERE virtual_parent_id = $1",
+                    cable_id,
+                )
+                await conn.execute(
+                    "UPDATE geo_segments SET is_hidden = false WHERE source_id = $1",
+                    cable_id,
+                )
+                return []
+
+            new_source_ids: List[str] = []
+            for i in range(len(chain_points) - 1):
+                a = chain_points[i]
+                b = chain_points[i + 1]
+                sub_id = f"{cable_id}::v{i}"
+                new_source_ids.append(sub_id)
+                await conn.execute(
+                    """
+                    INSERT INTO geo_segments
+                        (source_id, parent_id, ma_tuyen, start_point_id, end_point_id,
+                         geometry, geometry_source, geometry_version, is_deleted,
+                         virtual_parent_id, is_hidden)
+                    VALUES
+                        ($1, $2, $3, $4, $5,
+                         ST_SetSRID(ST_MakeLine(ST_MakePoint($6, $7), ST_MakePoint($8, $9)), 4326),
+                         'AUTO', 1, false, $10, false)
+                    ON CONFLICT (source_id) DO UPDATE SET
+                        parent_id = EXCLUDED.parent_id,
+                        ma_tuyen = EXCLUDED.ma_tuyen,
+                        start_point_id = EXCLUDED.start_point_id,
+                        end_point_id = EXCLUDED.end_point_id,
+                        is_deleted = false,
+                        virtual_parent_id = EXCLUDED.virtual_parent_id,
+                        is_hidden = false,
+                        geometry = CASE
+                            WHEN geo_segments.geometry_source = 'AUTO'
+                            THEN EXCLUDED.geometry
+                            ELSE geo_segments.geometry
+                        END
+                    """,
+                    sub_id, parent_id, ma_tuyen, a["ma_diem"], b["ma_diem"],
+                    a["lng"], a["lat"], b["lng"], b["lat"], cable_id,
+                )
+
+            await conn.execute(
+                "DELETE FROM geo_segments WHERE virtual_parent_id = $1 AND NOT (source_id = ANY($2::text[]))",
+                cable_id, new_source_ids,
+            )
+            await conn.execute(
+                "UPDATE geo_segments SET is_hidden = true WHERE source_id = $1",
+                cable_id,
+            )
+            return new_source_ids
+
+
 async def soft_delete_segments(pool: asyncpg.pool.Pool, source_ids: List[str]) -> int:
-    """Đánh dấu is_deleted=true cho các đoạn cáp không còn active ở MongoDB."""
     if not source_ids:
         return 0
     result = await pool.execute(
@@ -366,7 +345,7 @@ async def get_segment(pool: asyncpg.pool.Pool, source_id: str) -> Optional[Dict[
     row = await pool.fetchrow(
         """
         SELECT source_id, parent_id, ma_tuyen, start_point_id, end_point_id,
-               geometry_source, geometry_version,
+               geometry_source, geometry_version, virtual_parent_id, is_hidden,
                ST_AsGeoJSON(geometry) AS geometry_geojson
         FROM geo_segments
         WHERE source_id = $1 AND is_deleted = false
@@ -382,7 +361,7 @@ async def get_segments_by_ids(pool: asyncpg.pool.Pool, source_ids: List[str]) ->
     rows = await pool.fetch(
         """
         SELECT source_id, parent_id, ma_tuyen, start_point_id, end_point_id,
-               geometry_source, geometry_version,
+               geometry_source, geometry_version, virtual_parent_id, is_hidden,
                ST_AsGeoJSON(geometry) AS geometry_geojson
         FROM geo_segments
         WHERE source_id = ANY($1::text[]) AND is_deleted = false
@@ -398,14 +377,6 @@ async def get_segments_bbox(
     limit: int,
     simplify_tolerance: Optional[float] = None,
 ) -> List[Dict[str, Any]]:
-    """
-    `simplify_tolerance` (độ, cùng đơn vị SRID 4326) nếu > 0 sẽ áp dụng
-    ST_SimplifyPreserveTopology để giảm số vertex của LineString trước khi
-    trả về — hữu ích khi zoom nhỏ, đoạn cáp do người dùng tự vẽ tay (USER)
-    có nhiều điểm uốn, giảm dung lượng response mà hình dạng tổng thể không
-    đổi đáng kể ở độ phân giải hiển thị đó. Đoạn AUTO (2 điểm) không bị ảnh
-    hưởng gì (không thể đơn giản hoá thêm được nữa).
-    """
     geom_expr = "geometry"
     if simplify_tolerance and simplify_tolerance > 0:
         geom_expr = f"ST_SimplifyPreserveTopology(geometry, {float(simplify_tolerance)})"
@@ -413,10 +384,11 @@ async def get_segments_bbox(
     rows = await pool.fetch(
         f"""
         SELECT source_id, parent_id, ma_tuyen, start_point_id, end_point_id,
-               geometry_source, geometry_version,
+               geometry_source, geometry_version, virtual_parent_id, is_hidden,
                ST_AsGeoJSON({geom_expr}) AS geometry_geojson
         FROM geo_segments
         WHERE is_deleted = false
+          AND is_hidden = false
           AND geometry && ST_MakeEnvelope($1, $2, $3, $4, 4326)
         LIMIT $5
         """,
@@ -426,14 +398,13 @@ async def get_segments_bbox(
 
 
 async def get_segments_by_parent(pool: asyncpg.pool.Pool, parent_id: str) -> List[Dict[str, Any]]:
-    """Toàn bộ segment active thuộc 1 tuyến (parent_id = tuyến._id), dùng cho GET /map/routes."""
     rows = await pool.fetch(
         """
         SELECT source_id, parent_id, ma_tuyen, start_point_id, end_point_id,
-               geometry_source, geometry_version,
+               geometry_source, geometry_version, virtual_parent_id, is_hidden,
                ST_AsGeoJSON(geometry) AS geometry_geojson
         FROM geo_segments
-        WHERE parent_id = $1 AND is_deleted = false
+        WHERE parent_id = $1 AND is_deleted = false AND is_hidden = false
         """,
         parent_id,
     )
@@ -441,10 +412,8 @@ async def get_segments_by_parent(pool: asyncpg.pool.Pool, parent_id: str) -> Lis
 
 
 async def get_segment_ids_by_parent_all(pool: asyncpg.pool.Pool, parent_id: str) -> List[Dict[str, Any]]:
-    """Toàn bộ đoạn cáp thuộc 1 tuyến trong PostGIS (KHÔNG lọc is_deleted) -
-    dùng để incremental sync so sánh với danh sách active hiện tại ở MongoDB."""
     rows = await pool.fetch(
-        "SELECT source_id, is_deleted FROM geo_segments WHERE parent_id = $1",
+        "SELECT source_id, is_deleted FROM geo_segments WHERE parent_id = $1 AND virtual_parent_id IS NULL",
         parent_id,
     )
     return [dict(r) for r in rows]
@@ -459,6 +428,7 @@ async def nearby_segments(
                ST_Distance(geometry::geography, ST_SetSRID(ST_MakePoint($1, $2), 4326)::geography) AS distance_m
         FROM geo_segments
         WHERE is_deleted = false
+          AND is_hidden = false
           AND ST_DWithin(
             geometry::geography,
             ST_SetSRID(ST_MakePoint($1, $2), 4326)::geography,
@@ -479,12 +449,6 @@ async def update_segment_geometry(
     geometry_source: str,
     expected_version: Optional[int] = None,
 ) -> Optional[Dict[str, Any]]:
-    """
-    Cập nhật geometry của 1 segment, tăng geometry_version.
-    Trả về None nếu segment không tồn tại (hoặc đã bị soft-delete), hoặc nếu
-    expected_version không khớp (optimistic locking) — trong trường hợp đó
-    raise ValueError riêng để router phân biệt 404 vs 409.
-    """
     async with pool.acquire() as conn:
         async with conn.transaction():
             existing = await conn.fetchrow(
@@ -509,7 +473,7 @@ async def update_segment_geometry(
                     geometry_version = geometry_version + 1
                 WHERE source_id = $1
                 RETURNING source_id, parent_id, ma_tuyen, start_point_id, end_point_id,
-                          geometry_source, geometry_version,
+                          geometry_source, geometry_version, virtual_parent_id, is_hidden,
                           ST_AsGeoJSON(geometry) AS geometry_geojson
                 """,
                 source_id,

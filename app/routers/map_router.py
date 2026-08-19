@@ -7,10 +7,11 @@ from app.core.postgis import get_pg_pool
 from app.core.database import get_database, COLLECTION_POINTS
 from app.core.config import settings
 from app.models.geo import SegmentGeometryUpdateRequest, PointGeometryUpdateRequest
+from app.models.point import PointGeoSyncRequest
 from app.repositories import gis_repository
 from app.services.gis_sync_service import run_full_sync
 from app.services.gis_sid_service import build_sid_map_data, get_segment_sid_list, COLLECTION_TUYEN
-from app.services.gis_point_service import update_point_location
+from app.services.gis_point_service import update_point_location, sync_point_geometry_from_payload
 
 router = APIRouter(prefix="/map", tags=["Map / GIS"])
 
@@ -46,6 +47,8 @@ def _segment_row_to_response(row: dict) -> dict:
         "geometry": row["geometry"],
         "geometry_source": row["geometry_source"],
         "geometry_version": row["geometry_version"],
+        "virtual_parent_id": row.get("virtual_parent_id"),
+        "is_hidden": row.get("is_hidden", False),
     }
 
 
@@ -54,25 +57,11 @@ def _clamp_limit(limit: int) -> int:
 
 
 def _zoom_to_simplify_tolerance(zoom: int) -> float:
-    """
-    Ước lượng tolerance (độ, SRID 4326) cho ST_SimplifyPreserveTopology dựa
-    theo zoom Web Mercator chuẩn (không cần chính xác tuyệt đối - chỉ cần đủ
-    hợp lý để giảm vertex ở zoom nhỏ mà không làm méo hình dạng ở zoom lớn).
-
-    Công thức gần đúng: độ phân giải (mét/pixel) ở zoom z xấp xỉ
-    156543 / 2^z (bỏ qua hệ số cos(lat) cho đơn giản - chấp nhận được vì đây
-    chỉ là tolerance đơn giản hoá, không phải toạ độ hiển thị). Nhân với số
-    pixel cho phép sai lệch (2px) rồi quy đổi thô sang độ (~111320 m/độ).
-    """
     meters_per_pixel = 156543.03392 / (2 ** max(zoom, 0))
-    tolerance_m = meters_per_pixel * 2  # cho phép lệch ~2px khi vẽ
+    tolerance_m = meters_per_pixel * 2
     tolerance_deg = tolerance_m / 111320.0
     return tolerance_deg
 
-
-# ---------------------------------------------------------------------------
-# Points
-# ---------------------------------------------------------------------------
 
 @router.get("/points", summary="Danh sách điểm theo BBox (viewport), có gom cụm theo zoom")
 async def list_points_bbox(
@@ -89,25 +78,6 @@ async def list_points_bbox(
     limit: int = Query(2000, ge=1, le=20000),
     pool: asyncpg.pool.Pool = Depends(get_pool),
 ):
-    """
-    Trả về danh sách điểm nằm trong viewport (BBox) để render lên Google Maps.
-    Tận dụng spatial index GIST trên geo_points.geometry (toán tử &&).
-
-    **Gom cụm (mặc định bật):** chia viewport thành lưới `grid_size x grid_size`
-    ô đều nhau (giống marker clustering của Google Maps). Mỗi ô:
-    - chỉ có 1 điểm -> trả về điểm thật (`type: "point"`)
-    - có nhiều điểm -> gom thành 1 `type: "cluster"` (tâm trung bình + số
-      lượng + bbox bao quanh để frontend `fitBounds` khi người dùng click
-      vào cụm để zoom sâu hơn)
-
-    Nhờ lưới chia theo chính viewport (không phải toạ độ tuyệt đối cố định),
-    **kích thước response luôn bị chặn bởi `grid_size²`, không phụ thuộc số
-    điểm thực tế** — giải quyết đúng vấn đề tải toàn bộ điểm khi zoom nhỏ.
-    Khi viewport đã hẹp (zoom lớn), số điểm thực tế thường ít hơn số ô ->
-    mỗi ô có đúng 1 điểm -> tự động trả điểm thật, không bị gom nữa.
-
-    Truyền `cluster=false` để luôn nhận điểm thật không gom cụm (hành vi cũ).
-    """
     if min_lng >= max_lng or min_lat >= max_lat:
         raise HTTPException(status_code=400, detail="BBox không hợp lệ (min phải nhỏ hơn max).")
 
@@ -153,8 +123,6 @@ async def list_points_bbox(
                         "min_lng": r["min_lng"], "min_lat": r["min_lat"],
                         "max_lng": r["max_lng"], "max_lat": r["max_lat"],
                     },
-                    # ma_tuyen mẫu, chỉ để tham khảo hiển thị (cụm có thể gồm
-                    # điểm của nhiều tuyến khác nhau)
                     "ma_tuyen": r["sample_ma_tuyen"],
                 })
         return {"success": True, "data": data}
@@ -172,31 +140,13 @@ async def get_point_detail(point_id: str, pool: asyncpg.pool.Pool = Depends(get_
 
 @router.put(
     "/points/{point_id}/geometry",
-    summary="Cập nhật toạ độ điểm (ghi đồng thời MongoDB lẫn PostGIS)",
+    summary="Cập nhật toạ độ điểm (chỉ ghi MongoDB, không đụng PostGIS)",
 )
 async def update_point_geometry_api(
     point_id: str,
     payload: PointGeometryUpdateRequest,
     db: AsyncIOMotorDatabase = Depends(get_db),
-    pool: asyncpg.pool.Pool = Depends(get_pool),
 ):
-    """
-    Cập nhật vị trí (lat/lng) của 1 điểm, ví dụ khi người dùng kéo marker
-    trên Google Maps để chỉnh lại toạ độ chính xác hơn.
-
-    KHÁC với cập nhật geometry đoạn cáp (chỉ ghi PostGIS): cập nhật điểm phải
-    ghi **cả MongoDB** (`vi_do`/`kinh_do` - nguồn dữ liệu nghiệp vụ chính,
-    được các API routing khác dùng) **lẫn PostGIS** (`geo_points.geometry` -
-    dùng cho spatial query/hiển thị map), để 2 nơi luôn khớp nhau.
-
-    Sau khi cập nhật, **mọi đoạn cáp nối tới điểm này sẽ dịch chuyển theo
-    ngay lập tức** - cả đoạn `AUTO` lẫn đoạn đã ở chế độ `USER` (đã tự chỉnh
-    tay). Với đoạn `USER`, chỉ đúng đầu mút trùng với điểm này được dịch
-    chuyển; các điểm uốn ở giữa (hình dạng người dùng đã tự vẽ) được **giữ
-    nguyên**. Danh sách các đoạn đã cập nhật trả về trong `refreshed_segments`
-    (kèm `geometry_source` của từng đoạn để biết đoạn nào chỉ bị "khớp lại
-    đầu mút" thay vì vẽ lại toàn bộ).
-    """
     lng, lat = payload.geometry.coordinates[0], payload.geometry.coordinates[1]
     modified_fields = {
         "modified_by_id": payload.modified_by_id,
@@ -206,7 +156,7 @@ async def update_point_geometry_api(
     }
 
     try:
-        result = await update_point_location(db, pool, point_id, lng, lat, modified_fields)
+        result = await update_point_location(db, point_id, lng, lat, modified_fields)
     except ValueError as e:
         raise HTTPException(status_code=404, detail=str(e))
     except Exception as e:
@@ -215,15 +165,34 @@ async def update_point_geometry_api(
     return {
         "success": True,
         "data": {
-            "point": _point_row_to_response(result["point"]),
-            "refreshed_segments": result["refreshed_segments"],
+            "point": result,
         },
     }
 
 
-# ---------------------------------------------------------------------------
-# Segments
-# ---------------------------------------------------------------------------
+@router.post(
+    "/points/sync-geometry",
+    summary="Đồng bộ lại toạ độ điểm sang PostGIS từ payload theo ma_diem (KHÔNG ghi MongoDB)",
+)
+async def sync_point_geometry_api(
+    payload: PointGeoSyncRequest,
+    pool: asyncpg.pool.Pool = Depends(get_pool),
+):
+    try:
+        result = await sync_point_geometry_from_payload(pool, payload)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Lỗi server: {str(e)}")
+
+    return {
+        "success": True,
+        "data": {
+            "point": _point_row_to_response(result["point"]) if result["point"] else None,
+            "refreshed_segments": result["refreshed_segments"],
+        },
+    }
+
 
 @router.get("/segments", summary="Danh sách đoạn cáp theo BBox (viewport)")
 async def list_segments_bbox(
@@ -236,29 +205,6 @@ async def list_segments_bbox(
     limit: int = Query(2000, ge=1, le=20000),
     pool: asyncpg.pool.Pool = Depends(get_pool),
 ):
-    """
-    Trả về các đoạn cáp (LineString GeoJSON) nằm trong viewport để vẽ polyline.
-
-    **Khác với điểm, đường (LineString) không thể gom cụm thành 1 hình đại
-    diện** như cách gom điểm (không có khái niệm "đường trung bình" hợp lý).
-    Thay vào đó áp dụng 2 kỹ thuật khi zoom nhỏ (bắt buộc phải truyền `zoom`
-    để 2 kỹ thuật này có tác dụng):
-
-    1. **Ẩn hoàn toàn khi zoom < `GIS_SEGMENTS_MIN_ZOOM_TO_LOAD`** (mặc định
-       12) — ở mức toàn quốc/toàn tỉnh, hàng trăm nghìn đoạn cáp gần như chỉ
-       là các điểm ảnh chồng lên nhau, không có giá trị hiển thị và cực kỳ
-       tốn băng thông. Trả về rỗng kèm `message` để frontend biết cần zoom
-       gần hơn (khuyến nghị: ở mức zoom này chỉ hiển thị `/map/points` gom
-       cụm để người dùng thấy "mật độ hạ tầng ở đâu", chưa cần vẽ đường).
-    2. **Tự đơn giản hoá geometry** (`ST_SimplifyPreserveTopology`) theo zoom
-       khi đã đủ zoom để tải — giảm số vertex của các đoạn `USER` (tự vẽ tay,
-       nhiều điểm uốn) mà không đổi hình dạng đáng kể ở độ phân giải hiển thị
-       đó. Đoạn `AUTO` (chỉ 2 điểm) không bị ảnh hưởng.
-
-    Nếu không truyền `zoom`, endpoint giữ hành vi cũ (trả nguyên bản, không
-    ẩn/không đơn giản hoá) — dùng cho các trường hợp cần dữ liệu đầy đủ như
-    `/map/routes`.
-    """
     if min_lng >= max_lng or min_lat >= max_lat:
         raise HTTPException(status_code=400, detail="BBox không hợp lệ (min phải nhỏ hơn max).")
 
@@ -296,20 +242,15 @@ async def get_segment_detail(
     pool: asyncpg.pool.Pool = Depends(get_pool),
     db: AsyncIOMotorDatabase = Depends(get_db),
 ):
-    """
-    Trả chi tiết 1 đoạn cáp để hiển thị khi click vào segment trên map, bao
-    gồm cả `sid_list` - danh sách toàn bộ SID (dịch vụ khách hàng) đang active
-    trên các sợi (cable_detail) thuộc đoạn cáp này. `sid_list` lấy trực tiếp
-    từ MongoDB (không cần đồng bộ sang PostGIS vì đây là business data, không
-    phải geometry).
-    """
     segment = await gis_repository.get_segment(pool, segment_id)
     if not segment:
         raise HTTPException(status_code=404, detail=f"Không tìm thấy đoạn cáp '{segment_id}' trong GIS layer.")
 
+    sid_source_id = segment.get("virtual_parent_id") or segment_id
+
     start_point = await gis_repository.get_point(pool, segment["start_point_id"])
     end_point = await gis_repository.get_point(pool, segment["end_point_id"])
-    sid_list = await get_segment_sid_list(db, segment_id)
+    sid_list = await get_segment_sid_list(db, sid_source_id)
 
     return {
         "success": True,
@@ -346,19 +287,6 @@ async def update_segment_geometry(
     payload: SegmentGeometryUpdateRequest,
     pool: asyncpg.pool.Pool = Depends(get_pool),
 ):
-    """
-    Cập nhật geometry (LineString) của 1 đoạn cáp sau khi người dùng chỉnh sửa
-    trên Google Maps.
-
-    Validate (ngoài Pydantic validator đã kiểm tra type/số lượng coordinate/
-    khoảng giá trị lng-lat hợp lệ):
-    - segment phải tồn tại trong GIS layer (start/end point coi như đã tồn
-      tại vì segment chỉ được sync sau khi cả 2 điểm có tọa độ hợp lệ).
-    - nếu expected_version được truyền, phải khớp version hiện tại (optimistic
-      locking) để tránh 2 người ghi đè chồng nhau.
-
-    geometry_version sẽ tự động += 1 sau mỗi lần update thành công.
-    """
     coords = payload.geometry.coordinates
     try:
         result = await gis_repository.update_segment_geometry(
@@ -369,7 +297,6 @@ async def update_segment_geometry(
             expected_version=payload.expected_version,
         )
     except ValueError as e:
-        # version mismatch
         raise HTTPException(status_code=409, detail=str(e))
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Lỗi server: {str(e)}")
@@ -380,13 +307,7 @@ async def update_segment_geometry(
     return {"success": True, "data": _segment_row_to_response(result)}
 
 
-# ---------------------------------------------------------------------------
-# Routes (tuyến) - trả riêng điểm + đoạn cáp của 1 tuyến, không lẫn tuyến khác
-# ---------------------------------------------------------------------------
-
 async def _resolve_tuyen_id(db: AsyncIOMotorDatabase, tuyen_id: Optional[str], ma_tuyen: Optional[str]) -> str:
-    """Trả về parent_id (tuyến._id) từ tuyen_id hoặc ma_tuyen. Giống cách
-    routing_service._resolve_parent_id đang làm, để 2 nơi hành xử nhất quán."""
     if tuyen_id:
         return tuyen_id
     sample = await db[COLLECTION_POINTS].find_one(
@@ -407,15 +328,6 @@ async def get_route_map(
     pool: asyncpg.pool.Pool = Depends(get_pool),
     db: AsyncIOMotorDatabase = Depends(get_db),
 ):
-    """
-    Truyền **một trong hai** `tuyen_id` hoặc `ma_tuyen`. Trả về toàn bộ điểm
-    và đoạn cáp (geometry) CHỈ thuộc tuyến đó, để frontend render riêng 1
-    tuyến trên map (ẩn hết các tuyến khác) khi người dùng chọn 1 tuyến từ
-    kết quả /map/search hoặc từ danh sách tuyến.
-
-    Không phân trang theo viewport (khác /map/points, /map/segments) vì mục
-    đích là xem toàn bộ 1 tuyến / zoom-to-fit, không phải duyệt bản đồ rộng.
-    """
     if not tuyen_id and not ma_tuyen:
         raise HTTPException(status_code=400, detail="Cần truyền tuyen_id hoặc ma_tuyen.")
 
@@ -446,13 +358,8 @@ async def get_route_map_by_path(
     pool: asyncpg.pool.Pool = Depends(get_pool),
     db: AsyncIOMotorDatabase = Depends(get_db),
 ):
-    """Giữ lại để tương thích ngược. Dùng GET /map/routes?tuyen_id=... hoặc ?ma_tuyen=... thay thế."""
     return await get_route_map(tuyen_id=route_id, ma_tuyen=None, pool=pool, db=db)
 
-
-# ---------------------------------------------------------------------------
-# Nearby
-# ---------------------------------------------------------------------------
 
 @router.get("/nearby", summary="Tìm điểm/đoạn cáp gần một vị trí")
 async def nearby(
@@ -496,10 +403,6 @@ async def nearby(
     return {"success": True, "data": result}
 
 
-# ---------------------------------------------------------------------------
-# Search (Mongo cho business search, PostGIS chỉ bổ sung tọa độ)
-# ---------------------------------------------------------------------------
-
 @router.get(
     "/search",
     summary="Tìm điểm và/hoặc tuyến theo ma_diem / ten_diem / ma_tuyen / ten_tuyen",
@@ -514,20 +417,6 @@ async def search(
     db: AsyncIOMotorDatabase = Depends(get_db),
     pool: asyncpg.pool.Pool = Depends(get_pool),
 ):
-    """
-    MongoDB là nguồn tìm kiếm chính xác nhất cho business data. PostGIS chỉ
-    dùng để lấy tọa độ (geometry) cho các kết quả tìm được.
-
-    Trả 2 loại kết quả:
-    - `type: "point"` — điểm khớp `ma_diem`/`ten_diem`/`ma_tuyen`, có sẵn `lat`/`lng`.
-      Nếu khớp qua `ma_tuyen` thì nhiều điểm cùng tuyến sẽ ra nhiều kết quả -
-      dùng để nhảy/zoom tới 1 điểm cụ thể, KHÔNG phải cách đúng để "xem cả
-      tuyến" (dễ nhầm với các tuyến khác đi qua khu vực gần đó).
-    - `type: "route"` — tuyến khớp `ma_tuyen`/`ten_tuyen`, trả về `source_id`
-      (= parent_id của tuyến) để gọi tiếp `GET /map/routes?tuyen_id=...`
-      hoặc `?ma_tuyen=...` — đây là cách đúng để hiển thị **riêng 1 tuyến**
-      trên map mà không lẫn tuyến khác.
-    """
     include_types = {t.strip() for t in type.split(",") if t.strip()}
     results: List[dict] = []
 
@@ -577,7 +466,7 @@ async def search(
             for t in matched_routes:
                 results.append({
                     "type": "route",
-                    "source_id": t["_id"],  # = tuyen_id, dùng cho GET /map/routes?tuyen_id=...
+                    "source_id": t["_id"],
                     "label": t.get("ten_tuyen") or t.get("ma_tuyen") or t["_id"],
                     "ma_tuyen": t.get("ma_tuyen"),
                     "lat": None,
@@ -589,10 +478,6 @@ async def search(
     return {"success": True, "data": results}
 
 
-# ---------------------------------------------------------------------------
-# SID map - chế độ xem map theo 1 SID cụ thể
-# ---------------------------------------------------------------------------
-
 @router.get(
     "/sid/{sid_value}",
     summary="Sơ đồ map theo SID: các điểm + đoạn cáp (geometry thật) mà SID đi qua",
@@ -602,30 +487,12 @@ async def get_sid_map(
     db: AsyncIOMotorDatabase = Depends(get_db),
     pool: asyncpg.pool.Pool = Depends(get_pool),
 ):
-    """
-    Tương tự luồng truy vết của `GET /routing/diagram/sid`
-    (SID → sid_cable → cable_detail/sợi → cable/đoạn → tuyến → điểm), nhưng
-    dùng cho chế độ xem MAP: trả `nodes` có sẵn `lat`/`lng` và `edges` có sẵn
-    `geometry` (LineString GeoJSON thật lấy từ PostGIS, không phải chỉ label).
-
-    Mỗi đoạn cáp (cable) chỉ xuất hiện 1 lần trong `edges` (gộp theo cable_id)
-    dù có nhiều sợi/SID cùng đi qua, kèm `list_sid` liệt kê các SID đó -
-    tránh vẽ trùng nhiều polyline chồng lên nhau trên cùng 1 đoạn.
-
-    Nếu đoạn cáp chưa được đồng bộ sang PostGIS (`/map/sync` chưa chạy),
-    `geometry` sẽ là đường thẳng tạm nối 2 điểm (giống quy tắc AUTO), kèm
-    `geometry_source: "AUTO"` để frontend biết đây là geometry ước lượng.
-    """
     try:
         result = await build_sid_map_data(db, pool, sid_value)
         return {"success": True, "data": result}
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Lỗi server: {str(e)}")
 
-
-# ---------------------------------------------------------------------------
-# Sync (vận hành / admin) - trigger đồng bộ Mongo -> PostGIS
-# ---------------------------------------------------------------------------
 
 @router.post(
     "/sync",
@@ -635,15 +502,6 @@ async def trigger_sync(
     db: AsyncIOMotorDatabase = Depends(get_db),
     pool: asyncpg.pool.Pool = Depends(get_pool),
 ):
-    """
-    Chạy đồng bộ toàn bộ điểm + đoạn cáp active từ MongoDB sang GIS layer.
-    Idempotent (upsert theo source_id) - an toàn để gọi lại nhiều lần, kể cả
-    trong lúc production đang chạy. KHÔNG thay đổi bất kỳ dữ liệu nào trong
-    MongoDB.
-
-    Cho dataset lớn, khuyến nghị chạy qua script CLI (scripts/gis_initial_sync.py)
-    thay vì gọi qua HTTP để tránh timeout request.
-    """
     try:
         result = await run_full_sync(db, pool)
         return {"success": True, "data": result}

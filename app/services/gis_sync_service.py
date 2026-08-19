@@ -1,15 +1,3 @@
-"""
-Sync/projection service: MongoDB (source of truth) -> PostGIS (GIS layer).
-
-Nguyên tắc:
-- KHÔNG đọc/ghi field mới vào MongoDB.
-- Idempotent: chạy lại nhiều lần không tạo duplicate (dùng upsert theo source_id).
-- Batch theo settings.GIS_SYNC_BATCH_SIZE để tránh N+1 query / tránh 1 câu
-  lệnh khổng lồ.
-- Điểm không có vi_do/kinh_do hợp lệ sẽ bị bỏ qua (không thể tạo geometry),
-  được log lại trong kết quả trả về để người vận hành biết cần bổ sung tọa độ.
-"""
-
 from datetime import datetime, timezone
 from typing import Any, Dict, List
 
@@ -19,6 +7,7 @@ from motor.motor_asyncio import AsyncIOMotorDatabase
 from app.core.config import settings
 from app.core.database import COLLECTION_POINTS, COLLECTION_CABLES
 from app.repositories import gis_repository
+from app.services.gis_virtual_segments import sync_virtual_segments_full
 
 
 def _valid_coord(lng: Any, lat: Any) -> bool:
@@ -30,7 +19,6 @@ def _valid_coord(lng: Any, lat: Any) -> bool:
 
 
 async def sync_points(db: AsyncIOMotorDatabase, pool: asyncpg.pool.Pool) -> Dict[str, Any]:
-    """Đồng bộ toàn bộ điểm active (is_deleted=false) từ Mongo sang geo_points."""
     cursor = db[COLLECTION_POINTS].find(
         {"is_deleted": False},
         {
@@ -80,19 +68,12 @@ async def sync_points(db: AsyncIOMotorDatabase, pool: asyncpg.pool.Pool) -> Dict
 
 
 async def sync_segments(db: AsyncIOMotorDatabase, pool: asyncpg.pool.Pool) -> Dict[str, Any]:
-    """
-    Đồng bộ toàn bộ đoạn cáp active từ Mongo sang geo_segments.
-    Geometry AUTO = đường thẳng start_point -> end_point (lấy tọa độ từ chính
-    collection Point). Nếu segment đã có geometry_source=USER trong PostGIS,
-    repository sẽ tự giữ nguyên geometry đã chỉnh tay (xem upsert_segments_batch).
-    """
     cables_cursor = db[COLLECTION_CABLES].find(
         {"is_deleted": False},
         {"_id": 1, "parent_id": 1, "ma_tuyen": 1, "start_point": 1, "end_point": 1},
     )
     cables = await cables_cursor.to_list(length=None)
 
-    # Lấy toạ độ tất cả các điểm liên quan trong 1 query (tránh N+1).
     point_ids = set()
     for c in cables:
         if c.get("start_point"):
@@ -149,10 +130,10 @@ async def sync_segments(db: AsyncIOMotorDatabase, pool: asyncpg.pool.Pool) -> Di
 
 
 async def run_full_sync(db: AsyncIOMotorDatabase, pool: asyncpg.pool.Pool) -> Dict[str, Any]:
-    """Entry point: đồng bộ điểm trước, rồi đến đoạn cáp (đoạn cần tọa độ điểm)."""
     started_at = datetime.now(timezone.utc)
     points_result = await sync_points(db, pool)
     segments_result = await sync_segments(db, pool)
+    virtual_result = await sync_virtual_segments_full(db, pool)
     finished_at = datetime.now(timezone.utc)
 
     return {
@@ -161,4 +142,5 @@ async def run_full_sync(db: AsyncIOMotorDatabase, pool: asyncpg.pool.Pool) -> Di
         "duration_seconds": (finished_at - started_at).total_seconds(),
         "points": points_result,
         "segments": segments_result,
+        "virtual_segments": virtual_result,
     }
