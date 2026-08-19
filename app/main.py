@@ -1,4 +1,8 @@
-from fastapi import FastAPI
+import logging
+
+from fastapi import FastAPI, Request, status
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from contextlib import asynccontextmanager
 
@@ -8,13 +12,13 @@ from app.core.config import settings
 from app.routers.routing import router as routing_router
 from app.routers.map_router import router as map_router
 
+logger = logging.getLogger("routing_api")
+logging.basicConfig(level=logging.INFO)
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     await connect_to_mongo()
-    # GIS layer (PostgreSQL/PostGIS) độc lập với MongoDB. Nếu Postgres chưa
-    # sẵn sàng, connect_to_postgis() chỉ log warning chứ không raise, để
-    # routing API (Mongo) hiện tại vẫn hoạt động bình thường.
     await connect_to_postgis()
     yield
     await close_mongo_connection()
@@ -32,7 +36,6 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
-# Add CORS middleware
 app.add_middleware(
     CORSMiddleware,
     allow_origins=settings.CORS_ORIGINS,
@@ -40,6 +43,23 @@ app.add_middleware(
     allow_methods=settings.CORS_ALLOW_METHODS,
     allow_headers=settings.CORS_ALLOW_HEADERS,
 )
+
+
+@app.exception_handler(RequestValidationError)
+async def validation_exception_handler(request: Request, exc: RequestValidationError):
+    raw_body = await request.body()
+    logger.error(
+        "422 Validation error | method=%s path=%s errors=%s raw_body=%s",
+        request.method,
+        request.url.path,
+        exc.errors(),
+        raw_body.decode("utf-8", errors="replace"),
+    )
+    return JSONResponse(
+        status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+        content={"detail": exc.errors(), "raw_body": raw_body.decode("utf-8", errors="replace")},
+    )
+
 
 app.include_router(routing_router, prefix="/api/v1")
 app.include_router(map_router, prefix="/api/v1")

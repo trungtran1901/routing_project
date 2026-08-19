@@ -93,6 +93,40 @@ async def _get_point_by_ma(
     return await db[COLLECTION_POINTS].find_one({"ma_diem": ma_diem, "is_deleted": False})
 
 
+def _point_type_value(point_doc: Dict[str, Any]) -> Optional[str]:
+    pt = point_doc.get("point_type")
+    return pt.get("value") if isinstance(pt, dict) else None
+
+
+def _point_start_point_ma(point_doc: Dict[str, Any]) -> Optional[str]:
+    sp = point_doc.get("start_point")
+    return sp.get("value") if isinstance(sp, dict) else None
+
+
+async def _resolve_real_anchor_point(
+    db: AsyncIOMotorDatabase,
+    ma_diem: str,
+) -> Dict[str, Any]:
+    current_ma = ma_diem
+    visited: set = set()
+    current_doc = await _get_point_by_ma(db, current_ma)
+    if current_doc is None:
+        raise ValueError(f"Không tìm thấy điểm bắt đầu '{current_ma}'")
+
+    while _point_type_value(current_doc) in POINT_TYPES_SKIP_CABLE:
+        visited.add(current_ma)
+        prev_ma = _point_start_point_ma(current_doc)
+        if not prev_ma or prev_ma in visited:
+            break
+        prev_doc = await _get_point_by_ma(db, prev_ma)
+        if prev_doc is None:
+            break
+        current_ma = prev_ma
+        current_doc = prev_doc
+
+    return current_doc
+
+
 async def _update_so_luong_mx(
     db: AsyncIOMotorDatabase,
     parent_id: str,
@@ -192,6 +226,9 @@ async def handle_add_point_to_end(
             "so_luong_mx": so_luong_mx,
         }
 
+    if _point_type_value(last_point) in POINT_TYPES_SKIP_CABLE:
+        last_point = await _resolve_real_anchor_point(db, last_point["ma_diem"])
+
     tuyen_info = await _get_tuyen_info(db, parent_id)
     total_cable = tuyen_info.get("total_cable") if tuyen_info else None
     cable_type = tuyen_info.get("loai_cable_f0") if tuyen_info else None
@@ -228,16 +265,19 @@ async def handle_insert_point_between(
     parent_id = new_point["parent_id"]
     ma_tuyen = new_point.get("ma_tuyen")
 
-    start_point_doc = await _get_point_by_ma(db, start_point_ma)
-    if start_point_doc is None:
+    predecessor_doc = await _get_point_by_ma(db, start_point_ma)
+    if predecessor_doc is None:
         raise ValueError(f"Không tìm thấy điểm bắt đầu '{start_point_ma}'")
+
+    anchor_point_doc = await _resolve_real_anchor_point(db, start_point_ma)
+    anchor_ma = anchor_point_doc["ma_diem"]
 
     tuyen_info = await _get_tuyen_info(db, parent_id)
     total_cable = tuyen_info.get("total_cable") if tuyen_info else None
     cable_type = tuyen_info.get("loai_cable_f0") if tuyen_info else None
 
     existing_cable = await db[COLLECTION_CABLES].find_one(
-        {"start_point": start_point_ma, "is_deleted": False}
+        {"start_point": anchor_ma, "parent_id": parent_id, "is_deleted": False}
     )
 
     now = _now()
@@ -250,13 +290,16 @@ async def handle_insert_point_between(
         old_end_doc = await _get_point_by_ma(db, old_end_ma)
         old_end_ten = old_end_doc["ten_diem"] if old_end_doc else old_end_ma
 
-        await _soft_delete_cable_between(db, start_point_ma, old_end_ma, now)
-        disabled_cables.append(existing_cable.get("code", f"{start_point_ma}-{old_end_ma}"))
+        await db[COLLECTION_CABLES].update_one(
+            {"_id": existing_cable["_id"], "is_deleted": False},
+            {"$set": {"is_deleted": True, "modified_by_date": now}},
+        )
+        disabled_cables.append(existing_cable.get("code", f"{anchor_ma}-{old_end_ma}"))
 
         cable1 = _build_cable_doc(
             parent_id=parent_id,
-            start_ma=start_point_ma,
-            start_ten=start_point_doc["ten_diem"],
+            start_ma=anchor_ma,
+            start_ten=anchor_point_doc["ten_diem"],
             end_ma=new_point["ma_diem"],
             end_ten=new_point["ten_diem"],
             user_fields=user_fields,
@@ -295,8 +338,8 @@ async def handle_insert_point_between(
     else:
         cable1 = _build_cable_doc(
             parent_id=parent_id,
-            start_ma=start_point_ma,
-            start_ten=start_point_doc["ten_diem"],
+            start_ma=anchor_ma,
+            start_ten=anchor_point_doc["ten_diem"],
             end_ma=new_point["ma_diem"],
             end_ten=new_point["ten_diem"],
             user_fields=user_fields,
@@ -311,7 +354,7 @@ async def handle_insert_point_between(
         return {
             "action": "insert_between",
             "message": (
-                f"Không tìm thấy đoạn tiếp theo của '{start_point_ma}' "
+                f"Không tìm thấy đoạn tiếp theo của '{anchor_ma}' "
                 f"(đang là cuối tuyến). Tạo 1 đoạn mới: '{cable1['code']}'."
             ),
             "disabled_cables": [],

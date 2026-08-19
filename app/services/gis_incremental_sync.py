@@ -116,6 +116,9 @@ async def sync_route_scope(
         if not r["is_deleted"] and r["source_id"] not in active_segment_ids
     ]
     soft_deleted_segments = await gis_repository.soft_delete_segments(pool, stale_segment_ids)
+    soft_deleted_virtual_segments = await gis_repository.soft_delete_virtual_segments_by_parent(
+        pool, stale_segment_ids
+    )
 
     virtual_result = await sync_virtual_segments_for_route(pool, parent_id, mongo_points, mongo_cables)
 
@@ -129,6 +132,7 @@ async def sync_route_scope(
         "segments": {
             "upserted": upserted_segments,
             "soft_deleted": soft_deleted_segments,
+            "soft_deleted_virtual": soft_deleted_virtual_segments,
             "skipped_missing_coordinate": len(skipped_cables),
         },
         "virtual_segments": virtual_result,

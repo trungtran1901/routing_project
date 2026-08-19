@@ -51,7 +51,7 @@ class PointCreateRequest(BaseModel):
     station: Optional[StationModel] = None
 
     start_point: Optional[StartPointRefModel] = None
-    stt_start_point: Optional[int] = 0
+    stt_start_point: Optional[float] = 0
 
     is_deleted: bool = False
     is_active: bool = True
@@ -86,7 +86,7 @@ class PointGeoSyncRequest(BaseModel):
     station: Optional[StationModel] = None
 
     start_point: Optional[StartPointRefModel] = None
-    stt_start_point: Optional[int] = 0
+    stt_start_point: Optional[float] = 0
 
     is_deleted: bool = False
     is_active: bool = True

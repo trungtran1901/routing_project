@@ -92,6 +92,7 @@ async def sync_segments(db: AsyncIOMotorDatabase, pool: asyncpg.pool.Pool) -> Di
 
     batch: List[Dict[str, Any]] = []
     synced = 0
+    active_cable_ids: List[str] = []
     skipped_missing_coord: List[str] = []
 
     for c in cables:
@@ -105,6 +106,7 @@ async def sync_segments(db: AsyncIOMotorDatabase, pool: asyncpg.pool.Pool) -> Di
             skipped_missing_coord.append(cable_id)
             continue
 
+        active_cable_ids.append(cable_id)
         batch.append({
             "source_id": cable_id,
             "parent_id": c.get("parent_id"),
@@ -122,8 +124,21 @@ async def sync_segments(db: AsyncIOMotorDatabase, pool: asyncpg.pool.Pool) -> Di
     if batch:
         synced += await gis_repository.upsert_segments_batch(pool, batch)
 
+    active_segment_ids = set(active_cable_ids)
+    existing_geo_segments = await gis_repository.get_all_segment_ids_non_virtual(pool)
+    stale_segment_ids = [
+        r["source_id"] for r in existing_geo_segments
+        if not r["is_deleted"] and r["source_id"] not in active_segment_ids
+    ]
+    soft_deleted_segments = await gis_repository.soft_delete_segments(pool, stale_segment_ids)
+    soft_deleted_virtual_segments = await gis_repository.soft_delete_virtual_segments_by_parent(
+        pool, stale_segment_ids
+    )
+
     return {
         "synced_segments": synced,
+        "soft_deleted_segments": soft_deleted_segments,
+        "soft_deleted_virtual_segments": soft_deleted_virtual_segments,
         "skipped_missing_coordinate": len(skipped_missing_coord),
         "skipped_cable_id_sample": skipped_missing_coord[:20],
     }

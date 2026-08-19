@@ -335,6 +335,19 @@ async def soft_delete_segments(pool: asyncpg.pool.Pool, source_ids: List[str]) -
         return len(source_ids)
 
 
+async def soft_delete_virtual_segments_by_parent(pool: asyncpg.pool.Pool, parent_ids: List[str]) -> int:
+    if not parent_ids:
+        return 0
+    result = await pool.execute(
+        "UPDATE geo_segments SET is_deleted = true WHERE virtual_parent_id = ANY($1::text[]) AND is_deleted = false",
+        parent_ids,
+    )
+    try:
+        return int(result.split(" ")[-1])
+    except (ValueError, IndexError):
+        return len(parent_ids)
+
+
 def _row_to_segment_dict(row) -> Dict[str, Any]:
     d = dict(row)
     d["geometry"] = json.loads(d.pop("geometry_geojson"))
@@ -415,6 +428,13 @@ async def get_segment_ids_by_parent_all(pool: asyncpg.pool.Pool, parent_id: str)
     rows = await pool.fetch(
         "SELECT source_id, is_deleted FROM geo_segments WHERE parent_id = $1 AND virtual_parent_id IS NULL",
         parent_id,
+    )
+    return [dict(r) for r in rows]
+
+
+async def get_all_segment_ids_non_virtual(pool: asyncpg.pool.Pool) -> List[Dict[str, Any]]:
+    rows = await pool.fetch(
+        "SELECT source_id, is_deleted FROM geo_segments WHERE virtual_parent_id IS NULL",
     )
     return [dict(r) for r in rows]
 
