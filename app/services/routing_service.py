@@ -76,6 +76,20 @@ def _build_cable_doc(
     }
 
 
+def _build_start_point_ref(point_doc: Dict[str, Any]) -> Dict[str, Any]:
+    raw_id = point_doc.get("_id")
+    return {
+        "label": point_doc.get("ten_diem"),
+        "value": point_doc.get("ma_diem"),
+        "data_source": "hatang_quanlytuyen_newversion_detail_list",
+        "view_to_open_link": None,
+        "display_member": "ten_diem",
+        "value_member": "ma_diem",
+        "option": {},
+        "_id": str(raw_id) if raw_id is not None else None,
+    }
+
+
 async def _get_tuyen_info(
     db: AsyncIOMotorDatabase,
     parent_id: str,
@@ -91,6 +105,13 @@ async def _get_point_by_ma(
     ma_diem: str,
 ) -> Optional[Dict[str, Any]]:
     return await db[COLLECTION_POINTS].find_one({"ma_diem": ma_diem, "is_deleted": False})
+
+
+async def _get_point_by_ma_any(
+    db: AsyncIOMotorDatabase,
+    ma_diem: str,
+) -> Optional[Dict[str, Any]]:
+    return await db[COLLECTION_POINTS].find_one({"ma_diem": ma_diem})
 
 
 def _point_type_value(point_doc: Dict[str, Any]) -> Optional[str]:
@@ -125,6 +146,61 @@ async def _resolve_real_anchor_point(
         current_doc = prev_doc
 
     return current_doc
+
+
+async def _reparent_downstream_ha_ngam(
+    db: AsyncIOMotorDatabase,
+    start_point_ma: str,
+    new_point_ma: str,
+    now: datetime,
+) -> int:
+    new_point_doc = await _get_point_by_ma(db, new_point_ma)
+    if new_point_doc is None:
+        return 0
+
+    new_start_point_ref = _build_start_point_ref(new_point_doc)
+
+    result = await db[COLLECTION_POINTS].update_many(
+        {
+            "start_point.value": start_point_ma,
+            "ma_diem": {"$ne": new_point_ma},
+            "point_type.value": "Hạ ngầm",
+            "is_deleted": False,
+        },
+        {"$set": {
+            "start_point": new_start_point_ref,
+            "modified_by_date": now,
+        }},
+    )
+    return result.modified_count
+
+
+async def _reparent_downstream_ha_ngam_to_predecessor(
+    db: AsyncIOMotorDatabase,
+    deleted_ma_diem: str,
+    predecessor_ma: Optional[str],
+    now: datetime,
+) -> int:
+    if not predecessor_ma:
+        return 0
+
+    predecessor_doc = await _get_point_by_ma_any(db, predecessor_ma)
+    if predecessor_doc is None:
+        return 0
+
+    new_start_point_ref = _build_start_point_ref(predecessor_doc)
+
+    result = await db[COLLECTION_POINTS].update_many(
+        {
+            "start_point.value": deleted_ma_diem,
+            "point_type.value": "Hạ ngầm",
+        },
+        {"$set": {
+            "start_point": new_start_point_ref,
+            "modified_by_date": now,
+        }},
+    )
+    return result.modified_count
 
 
 async def _update_so_luong_mx(
@@ -264,10 +340,16 @@ async def handle_insert_point_between(
 ) -> Dict[str, Any]:
     parent_id = new_point["parent_id"]
     ma_tuyen = new_point.get("ma_tuyen")
+    ma_diem_moi = new_point["ma_diem"]
+    now = _now()
 
     predecessor_doc = await _get_point_by_ma(db, start_point_ma)
     if predecessor_doc is None:
         raise ValueError(f"Không tìm thấy điểm bắt đầu '{start_point_ma}'")
+
+    reparented_count = await _reparent_downstream_ha_ngam(
+        db, start_point_ma, ma_diem_moi, now,
+    )
 
     anchor_point_doc = await _resolve_real_anchor_point(db, start_point_ma)
     anchor_ma = anchor_point_doc["ma_diem"]
@@ -280,7 +362,6 @@ async def handle_insert_point_between(
         {"start_point": anchor_ma, "parent_id": parent_id, "is_deleted": False}
     )
 
-    now = _now()
     user_fields = _extract_user_fields(new_point)
     created_cables: List[str] = []
     disabled_cables: List[str] = []
@@ -330,9 +411,15 @@ async def handle_insert_point_between(
             "message": (
                 f"Vô hiệu hóa đoạn '{disabled_cables[0]}', "
                 f"tạo 2 đoạn mới: {created_cables}."
+                + (
+                    f" Đã nối lại {reparented_count} điểm Hạ ngầm phía sau '{start_point_ma}' sang '{ma_diem_moi}'."
+                    if reparented_count
+                    else ""
+                )
             ),
             "disabled_cables": disabled_cables,
             "created_cables": created_cables,
+            "reparented_ha_ngam": reparented_count,
             "so_luong_mx": so_luong_mx,
         }
     else:
@@ -356,9 +443,15 @@ async def handle_insert_point_between(
             "message": (
                 f"Không tìm thấy đoạn tiếp theo của '{anchor_ma}' "
                 f"(đang là cuối tuyến). Tạo 1 đoạn mới: '{cable1['code']}'."
+                + (
+                    f" Đã nối lại {reparented_count} điểm Hạ ngầm phía sau '{start_point_ma}' sang '{ma_diem_moi}'."
+                    if reparented_count
+                    else ""
+                )
             ),
             "disabled_cables": [],
             "created_cables": created_cables,
+            "reparented_ha_ngam": reparented_count,
             "so_luong_mx": so_luong_mx,
         }
 
@@ -366,23 +459,39 @@ async def handle_insert_point_between(
 async def handle_add_point_no_cable(
     db: AsyncIOMotorDatabase,
     new_point: Dict[str, Any],
+    start_point_ma: Optional[str] = None,
 ) -> Dict[str, Any]:
     parent_id = new_point["parent_id"]
+    ma_diem_moi = new_point["ma_diem"]
+    now = _now()
+
     point_type_label = None
     pt = new_point.get("point_type")
     if isinstance(pt, dict):
         point_type_label = pt.get("value")
 
-    so_luong_mx = await _update_so_luong_mx(db, parent_id, _now())
+    reparented_count = 0
+    if start_point_ma:
+        reparented_count = await _reparent_downstream_ha_ngam(
+            db, start_point_ma, ma_diem_moi, now,
+        )
+
+    so_luong_mx = await _update_so_luong_mx(db, parent_id, now)
 
     return {
         "action": "add_no_cable",
         "message": (
             f"Điểm loại '{point_type_label}' không làm thay đổi topology đoạn cáp - "
             f"giữ nguyên đoạn cáp hiện có, không tạo/xoá đoạn nào."
+            + (
+                f" Đã nối lại {reparented_count} điểm Hạ ngầm phía sau '{start_point_ma}' sang '{ma_diem_moi}'."
+                if reparented_count
+                else ""
+            )
         ),
         "created_cables": [],
         "disabled_cables": [],
+        "reparented_ha_ngam": reparented_count,
         "so_luong_mx": so_luong_mx,
     }
 
@@ -394,6 +503,11 @@ async def handle_delete_point(
     now = _now()
     ma_diem = request.ma_diem
 
+    deleted_point_doc = await _get_point_by_ma_any(db, ma_diem)
+    predecessor_ma = (
+        _point_start_point_ma(deleted_point_doc) if deleted_point_doc else None
+    )
+
     cable_in = await db[COLLECTION_CABLES].find_one(
         {"end_point": ma_diem, "is_deleted": False}
     )
@@ -402,6 +516,10 @@ async def handle_delete_point(
     )
 
     deleted_cable_ids = await _soft_delete_cables_by_point(db, ma_diem, now)
+
+    reparented_count = await _reparent_downstream_ha_ngam_to_predecessor(
+        db, ma_diem, predecessor_ma, now,
+    )
 
     created_cable: Optional[str] = None
 
@@ -453,10 +571,16 @@ async def handle_delete_point(
             f"Đã vô hiệu hóa {len(deleted_cable_ids)} đoạn cáp và cascade detail/sid "
             f"liên quan đến điểm '{ma_diem}'"
             + (f", tạo đoạn nối mới '{created_cable}'." if created_cable else ".")
+            + (
+                f" Đã nối lại {reparented_count} điểm Hạ ngầm phía sau '{ma_diem}' sang '{predecessor_ma}'."
+                if reparented_count
+                else ""
+            )
         ),
         "deleted_point": ma_diem,
         "affected_cables_count": len(deleted_cable_ids),
         "created_cable": created_cable,
+        "reparented_ha_ngam": reparented_count,
         "so_luong_mx": so_luong_mx,
     }
 
@@ -468,10 +592,10 @@ async def process_add_point(
     new_point = payload.model_dump(exclude_none=False)
 
     point_type_val = payload.point_type.value if payload.point_type is not None else None
-    if point_type_val in POINT_TYPES_SKIP_CABLE:
-        return await handle_add_point_no_cable(db, new_point)
-
     start_ma = payload.start_point.value if payload.start_point is not None else None
+
+    if point_type_val in POINT_TYPES_SKIP_CABLE:
+        return await handle_add_point_no_cable(db, new_point, start_ma)
 
     if start_ma:
         return await handle_insert_point_between(db, new_point, start_ma)

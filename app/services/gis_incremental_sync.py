@@ -1,3 +1,4 @@
+import traceback
 from typing import Any, Dict, List
 
 import asyncpg
@@ -17,6 +18,18 @@ def _valid_coord(lng: Any, lat: Any) -> bool:
 
 
 async def sync_route_scope(
+    db: AsyncIOMotorDatabase,
+    pool: asyncpg.pool.Pool,
+    parent_id: str,
+) -> Dict[str, Any]:
+    try:
+        return await _sync_route_scope_impl(db, pool, parent_id)
+    except Exception:
+        traceback.print_exc()
+        raise
+
+
+async def _sync_route_scope_impl(
     db: AsyncIOMotorDatabase,
     pool: asyncpg.pool.Pool,
     parent_id: str,
@@ -110,6 +123,7 @@ async def sync_route_scope(
     upserted_segments = await gis_repository.upsert_segments_batch(pool, active_segment_batch)
 
     active_segment_ids = {s["source_id"] for s in active_segment_batch}
+
     existing_geo_segments = await gis_repository.get_segment_ids_by_parent_all(pool, parent_id)
     stale_segment_ids = [
         r["source_id"] for r in existing_geo_segments
@@ -119,6 +133,16 @@ async def sync_route_scope(
     soft_deleted_virtual_segments = await gis_repository.soft_delete_virtual_segments_by_parent(
         pool, stale_segment_ids
     )
+
+    existing_virtual_parents = await gis_repository.get_virtual_segment_parents_by_route(pool, parent_id)
+    stale_virtual_parent_ids = [
+        r["virtual_parent_id"] for r in existing_virtual_parents
+        if r["virtual_parent_id"] not in active_segment_ids
+    ]
+    extra_soft_deleted_virtual_segments = await gis_repository.soft_delete_virtual_segments_by_parent(
+        pool, stale_virtual_parent_ids
+    )
+    soft_deleted_virtual_segments += extra_soft_deleted_virtual_segments
 
     virtual_result = await sync_virtual_segments_for_route(pool, parent_id, mongo_points, mongo_cables)
 

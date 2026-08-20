@@ -348,6 +348,20 @@ async def soft_delete_virtual_segments_by_parent(pool: asyncpg.pool.Pool, parent
         return len(parent_ids)
 
 
+async def get_virtual_segment_parents_by_route(pool: asyncpg.pool.Pool, parent_id: str) -> List[Dict[str, Any]]:
+    rows = await pool.fetch(
+        """
+        SELECT DISTINCT virtual_parent_id
+        FROM geo_segments
+        WHERE parent_id = $1
+          AND virtual_parent_id IS NOT NULL
+          AND is_deleted = false
+        """,
+        parent_id,
+    )
+    return [dict(r) for r in rows]
+
+
 def _row_to_segment_dict(row) -> Dict[str, Any]:
     d = dict(row)
     d["geometry"] = json.loads(d.pop("geometry_geojson"))
