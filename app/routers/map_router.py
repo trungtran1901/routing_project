@@ -6,7 +6,7 @@ from motor.motor_asyncio import AsyncIOMotorDatabase
 from app.core.postgis import get_pg_pool
 from app.core.database import get_database, COLLECTION_POINTS
 from app.core.config import settings
-from app.models.geo import SegmentGeometryUpdateRequest, PointGeometryUpdateRequest
+from app.models.geo import SegmentGeometryUpdateRequest, PointGeometryUpdateRequest, MeasureRequest
 from app.models.point import PointGeoSyncRequest
 from app.repositories import gis_repository
 from app.services.gis_sync_service import run_full_sync
@@ -49,6 +49,7 @@ def _segment_row_to_response(row: dict) -> dict:
         "geometry_version": row["geometry_version"],
         "virtual_parent_id": row.get("virtual_parent_id"),
         "is_hidden": row.get("is_hidden", False),
+        "length_m": round(row["length_m"], 2) if row.get("length_m") is not None else None,
     }
 
 
@@ -277,6 +278,7 @@ async def get_segment_geometry(segment_id: str, pool: asyncpg.pool.Pool = Depend
             "geometry": segment["geometry"],
             "geometry_source": segment["geometry_source"],
             "geometry_version": segment["geometry_version"],
+            "length_m": round(segment["length_m"], 2) if segment.get("length_m") is not None else None,
         },
     }
 
@@ -492,6 +494,43 @@ async def get_sid_map(
         return {"success": True, "data": result}
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Lỗi server: {str(e)}")
+
+
+@router.post(
+    "/measure",
+    summary="Đo khoảng cách theo danh sách điểm (vẽ nháp trên map, không lưu DB)",
+)
+async def measure_path_api(
+    payload: MeasureRequest,
+    pool: asyncpg.pool.Pool = Depends(get_pool),
+):
+    lngs = [p[0] for p in payload.points]
+    lats = [p[1] for p in payload.points]
+
+    try:
+        rows = await gis_repository.measure_path(pool, lngs, lats)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Lỗi server: {str(e)}")
+
+    segments = [
+        {
+            "from_index": r["from_index"] - 1,
+            "to_index": r["to_index"] - 1,
+            "length_m": round(r["length_m"], 2),
+        }
+        for r in rows
+    ]
+    total_length_m = sum(s["length_m"] for s in segments)
+
+    return {
+        "success": True,
+        "data": {
+            "segments": segments,
+            "total_length_m": round(total_length_m, 2),
+            "total_length_km": round(total_length_m / 1000.0, 3),
+            "point_count": len(payload.points),
+        },
+    }
 
 
 @router.post(

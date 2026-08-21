@@ -373,6 +373,7 @@ async def get_segment(pool: asyncpg.pool.Pool, source_id: str) -> Optional[Dict[
         """
         SELECT source_id, parent_id, ma_tuyen, start_point_id, end_point_id,
                geometry_source, geometry_version, virtual_parent_id, is_hidden,
+               length_m,
                ST_AsGeoJSON(geometry) AS geometry_geojson
         FROM geo_segments
         WHERE source_id = $1 AND is_deleted = false
@@ -389,6 +390,7 @@ async def get_segments_by_ids(pool: asyncpg.pool.Pool, source_ids: List[str]) ->
         """
         SELECT source_id, parent_id, ma_tuyen, start_point_id, end_point_id,
                geometry_source, geometry_version, virtual_parent_id, is_hidden,
+               length_m,
                ST_AsGeoJSON(geometry) AS geometry_geojson
         FROM geo_segments
         WHERE source_id = ANY($1::text[]) AND is_deleted = false
@@ -412,6 +414,7 @@ async def get_segments_bbox(
         f"""
         SELECT source_id, parent_id, ma_tuyen, start_point_id, end_point_id,
                geometry_source, geometry_version, virtual_parent_id, is_hidden,
+               length_m,
                ST_AsGeoJSON({geom_expr}) AS geometry_geojson
         FROM geo_segments
         WHERE is_deleted = false
@@ -429,6 +432,7 @@ async def get_segments_by_parent(pool: asyncpg.pool.Pool, parent_id: str) -> Lis
         """
         SELECT source_id, parent_id, ma_tuyen, start_point_id, end_point_id,
                geometry_source, geometry_version, virtual_parent_id, is_hidden,
+               length_m,
                ST_AsGeoJSON(geometry) AS geometry_geojson
         FROM geo_segments
         WHERE parent_id = $1 AND is_deleted = false AND is_hidden = false
@@ -436,6 +440,47 @@ async def get_segments_by_parent(pool: asyncpg.pool.Pool, parent_id: str) -> Lis
         parent_id,
     )
     return [_row_to_segment_dict(r) for r in rows]
+
+
+async def measure_path(
+    pool: asyncpg.pool.Pool,
+    lngs: List[float],
+    lats: List[float],
+) -> List[Dict[str, Any]]:
+    rows = await pool.fetch(
+        """
+        WITH pts AS (
+            SELECT ordinality AS idx, lng, lat
+            FROM unnest($1::double precision[], $2::double precision[]) WITH ORDINALITY AS t(lng, lat)
+        )
+        SELECT
+            a.idx AS from_index,
+            b.idx AS to_index,
+            ST_Distance(
+                ST_SetSRID(ST_MakePoint(a.lng, a.lat), 4326)::geography,
+                ST_SetSRID(ST_MakePoint(b.lng, b.lat), 4326)::geography
+            ) AS length_m
+        FROM pts a
+        JOIN pts b ON b.idx = a.idx + 1
+        ORDER BY a.idx
+        """,
+        lngs, lats,
+    )
+    return [dict(r) for r in rows]
+
+
+async def get_total_length_by_parent(pool: asyncpg.pool.Pool, parent_id: str) -> float:
+    row = await pool.fetchrow(
+        """
+        SELECT COALESCE(SUM(length_m), 0) AS total_length_m
+        FROM geo_segments
+        WHERE parent_id = $1
+          AND is_deleted = false
+          AND virtual_parent_id IS NULL
+        """,
+        parent_id,
+    )
+    return float(row["total_length_m"]) if row else 0.0
 
 
 async def get_segment_ids_by_parent_all(pool: asyncpg.pool.Pool, parent_id: str) -> List[Dict[str, Any]]:
@@ -508,6 +553,7 @@ async def update_segment_geometry(
                 WHERE source_id = $1
                 RETURNING source_id, parent_id, ma_tuyen, start_point_id, end_point_id,
                           geometry_source, geometry_version, virtual_parent_id, is_hidden,
+                          length_m,
                           ST_AsGeoJSON(geometry) AS geometry_geojson
                 """,
                 source_id,

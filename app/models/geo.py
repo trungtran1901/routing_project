@@ -5,10 +5,6 @@ from typing import Optional, List, Any, Dict, Literal
 GeometrySource = Literal["AUTO", "USER", "IMPORTED", "GOOGLE"]
 
 
-# ---------------------------------------------------------------------------
-# GeoJSON-ish input for LineString geometry update
-# ---------------------------------------------------------------------------
-
 class LineStringGeoJSON(BaseModel):
     type: Literal["LineString"]
     coordinates: List[List[float]]
@@ -47,33 +43,18 @@ class PointGeoJSON(BaseModel):
 
 
 class SegmentGeometryUpdateRequest(BaseModel):
-    """Payload PUT /map/segments/{segment_id}/geometry"""
     geometry: LineStringGeoJSON
     geometry_source: GeometrySource = "USER"
-    # Optional optimistic-locking: nếu client biết version hiện tại, backend
-    # sẽ so khớp trước khi ghi đè để tránh mất chỉnh sửa của người khác.
     expected_version: Optional[int] = None
 
 
 class PointGeometryUpdateRequest(BaseModel):
-    """
-    Payload PUT /map/points/{point_id}/geometry.
-
-    Khác với segment (chỉ ghi PostGIS), cập nhật toạ độ điểm phải ghi CẢ
-    MongoDB (vi_do/kinh_do - nguồn dữ liệu nghiệp vụ chính) LẪN PostGIS
-    (geometry - dùng cho spatial query/hiển thị map).
-    """
     geometry: PointGeoJSON
-    # Thông tin người thực hiện (tuỳ chọn) để ghi vào modified_by_* trên MongoDB.
     modified_by_id: Optional[str] = None
     modified_by_name: Optional[str] = None
     modified_by_fullname: Optional[str] = None
     modified_by_email: Optional[str] = None
 
-
-# ---------------------------------------------------------------------------
-# Response models
-# ---------------------------------------------------------------------------
 
 class MapPointResponse(BaseModel):
     source_id: str
@@ -92,9 +73,10 @@ class MapSegmentResponse(BaseModel):
     end_point_id: str
     ma_tuyen: Optional[str] = None
     parent_id: Optional[str] = None
-    geometry: Dict[str, Any]  # GeoJSON LineString
+    geometry: Dict[str, Any]
     geometry_source: str
     geometry_version: int
+    length_m: Optional[float] = None
 
 
 class MapSegmentDetailResponse(BaseModel):
@@ -114,6 +96,38 @@ class NearbySegmentResult(BaseModel):
     end_point_id: str
     ma_tuyen: Optional[str] = None
     distance_m: float
+
+
+class MeasureRequest(BaseModel):
+    points: List[List[float]]
+
+    @field_validator("points")
+    @classmethod
+    def validate_points(cls, points: List[List[float]]):
+        if len(points) < 2:
+            raise ValueError("Cần ít nhất 2 điểm để đo khoảng cách.")
+        for p in points:
+            if len(p) < 2:
+                raise ValueError("Mỗi điểm phải có dạng [lng, lat].")
+            lng, lat = p[0], p[1]
+            if not (-180.0 <= lng <= 180.0):
+                raise ValueError(f"Longitude không hợp lệ: {lng}")
+            if not (-90.0 <= lat <= 90.0):
+                raise ValueError(f"Latitude không hợp lệ: {lat}")
+        return points
+
+
+class MeasureSegmentResult(BaseModel):
+    from_index: int
+    to_index: int
+    length_m: float
+
+
+class MeasureResponse(BaseModel):
+    segments: List[MeasureSegmentResult]
+    total_length_m: float
+    total_length_km: float
+    point_count: int
 
 
 class MapSearchResultItem(BaseModel):
